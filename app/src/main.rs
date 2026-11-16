@@ -116,7 +116,8 @@ fn apply_config(app: &AppHandle, cfg: Config) -> Result<Config, String> {
     let _ = app.emit("status-changed", ());
     engine_result?;
     hotkey_result?;
-    Ok(state.engine.lock().unwrap().cfg.clone())
+    let current = state.engine.lock().unwrap().cfg.clone();
+    Ok(current)
 }
 
 // ───────────────────────────── Commandes ─────────────────────────────
