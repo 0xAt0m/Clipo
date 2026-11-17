@@ -188,60 +188,125 @@ pub fn list_mics() -> Vec<String> {
     Vec::new()
 }
 
-/// PID de l'application au premier plan si sa fenêtre couvre tout l'écran.
+/// Fenêtre au premier plan.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Foreground {
+    pub hwnd: u64,
+    pub pid: u32,
+    /// La fenêtre couvre tout son écran (plein écran ou fenêtré sans bordure).
+    pub fullscreen: bool,
+}
+
 #[cfg(windows)]
-pub fn fullscreen_foreground_pid() -> Option<u32> {
+mod win32 {
     #[repr(C)]
     #[derive(Default, Clone, Copy)]
-    struct Rect {
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
+    pub struct Rect {
+        pub left: i32,
+        pub top: i32,
+        pub right: i32,
+        pub bottom: i32,
     }
     #[repr(C)]
     #[derive(Default)]
-    struct MonitorInfo {
-        cb_size: u32,
-        rc_monitor: Rect,
-        rc_work: Rect,
-        flags: u32,
+    pub struct MonitorInfo {
+        pub cb_size: u32,
+        pub rc_monitor: Rect,
+        pub rc_work: Rect,
+        pub flags: u32,
     }
+    pub type MonitorEnumProc = unsafe extern "system" fn(isize, isize, *mut Rect, isize) -> i32;
     #[link(name = "user32")]
     extern "system" {
-        fn GetForegroundWindow() -> isize;
-        fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
-        fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
-        fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
-        fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+        pub fn GetForegroundWindow() -> isize;
+        pub fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        pub fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
+        pub fn IsWindow(hwnd: isize) -> i32;
+        pub fn IsIconic(hwnd: isize) -> i32;
+        pub fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+        pub fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+        pub fn EnumDisplayMonitors(hdc: isize, clip: *const Rect, callback: MonitorEnumProc, data: isize) -> i32;
     }
+}
+
+#[cfg(windows)]
+pub fn foreground() -> Option<Foreground> {
+    use win32::*;
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd == 0 {
             return None;
         }
-        let mut rect = Rect::default();
-        if GetWindowRect(hwnd, &mut rect) == 0 {
-            return None;
-        }
-        // MONITOR_DEFAULTTONEAREST
-        let monitor = MonitorFromWindow(hwnd, 2);
-        let mut info = MonitorInfo { cb_size: std::mem::size_of::<MonitorInfo>() as u32, ..Default::default() };
-        if monitor == 0 || GetMonitorInfoW(monitor, &mut info) == 0 {
-            return None;
-        }
-        let m = info.rc_monitor;
-        let covers = rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom;
-        if !covers {
-            return None;
-        }
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, &mut pid);
-        (pid != 0).then_some(pid)
+        if pid == 0 {
+            return None;
+        }
+        let mut rect = Rect::default();
+        let mut fullscreen = false;
+        if GetWindowRect(hwnd, &mut rect) != 0 {
+            // MONITOR_DEFAULTTONEAREST
+            let monitor = MonitorFromWindow(hwnd, 2);
+            let mut info = MonitorInfo { cb_size: std::mem::size_of::<MonitorInfo>() as u32, ..Default::default() };
+            if monitor != 0 && GetMonitorInfoW(monitor, &mut info) != 0 {
+                let m = info.rc_monitor;
+                fullscreen = rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom;
+            }
+        }
+        Some(Foreground { hwnd: hwnd as u64, pid, fullscreen })
     }
 }
 
+/// La fenêtre existe-t-elle encore ?
+#[cfg(windows)]
+pub fn window_alive(hwnd: u64) -> bool {
+    unsafe { win32::IsWindow(hwnd as isize) != 0 }
+}
+
+/// La fenêtre est-elle réduite dans la barre des tâches ?
+#[cfg(windows)]
+pub fn window_minimized(hwnd: u64) -> bool {
+    unsafe { win32::IsIconic(hwnd as isize) != 0 }
+}
+
+/// Position et taille (x, y, largeur, hauteur) d'un écran ; 0 = écran principal.
+#[cfg(windows)]
+pub fn monitor_rect(index: u32) -> Option<(i32, i32, i32, i32)> {
+    use win32::*;
+    unsafe extern "system" fn collect(_monitor: isize, _hdc: isize, rect: *mut Rect, data: isize) -> i32 {
+        let list = &mut *(data as *mut Vec<Rect>);
+        if !rect.is_null() {
+            list.push(*rect);
+        }
+        1
+    }
+    let mut list: Vec<Rect> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(0, std::ptr::null(), collect, &mut list as *mut Vec<Rect> as isize);
+    }
+    // L'écran principal a son coin en (0, 0) ; les autres suivent de gauche à droite.
+    list.sort_by_key(|r| (!(r.left == 0 && r.top == 0), r.left, r.top));
+    list.get(index as usize)
+        .or(list.first())
+        .map(|r| (r.left, r.top, r.right - r.left, r.bottom - r.top))
+}
+
 #[cfg(not(windows))]
-pub fn fullscreen_foreground_pid() -> Option<u32> {
+pub fn foreground() -> Option<Foreground> {
+    None
+}
+
+#[cfg(not(windows))]
+pub fn window_alive(_hwnd: u64) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn window_minimized(_hwnd: u64) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn monitor_rect(_index: u32) -> Option<(i32, i32, i32, i32)> {
     None
 }

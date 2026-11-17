@@ -10,12 +10,12 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     let cfg = Config::default();
     let log = dir.join("detect.log");
-    let pipe = ffmpeg::detect_pipeline(&ff, &cfg, &log, false);
+    let pipe = ffmpeg::detect_pipeline(&ff, &cfg, &log, 0);
     println!("Méthode retenue : {pipe:?}");
     println!("{}", std::fs::read_to_string(&log).unwrap_or_default());
     let Some(pipe) = pipe else { std::process::exit(1) };
-    println!("Arguments : {:?}", ffmpeg::capture_args(&cfg, pipe));
-    let rec = recorder::Recorder::start(ff, cfg, pipe, dir.clone());
+    println!("Arguments : {:?}", ffmpeg::capture_args(&cfg, pipe, 0));
+    let rec = recorder::Recorder::start(ff, cfg, pipe, dir.clone(), Default::default());
     std::thread::sleep(std::time::Duration::from_secs(7));
     let segs = rec.segments();
     println!("Segments après 7 s : {}", segs.len());

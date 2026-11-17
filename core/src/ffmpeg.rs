@@ -39,6 +39,8 @@ impl Encoder {
 /// Méthode de capture de l'écran.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum Grab {
+    /// Windows Graphics Capture : fenêtre du jeu ou écran, images sur le GPU.
+    Wgc,
     /// Desktop Duplication : les images restent sur le GPU.
     Dda,
     /// GDI : plus lourd, mais fonctionne partout (secours).
@@ -54,7 +56,7 @@ pub struct Pipeline {
 impl Pipeline {
     pub fn label(&self) -> String {
         match self.grab {
-            Grab::Dda => self.enc.label().to_string(),
+            Grab::Wgc | Grab::Dda => self.enc.label().to_string(),
             Grab::Gdi => format!("{} (capture de secours)", self.enc.label()),
         }
     }
@@ -64,15 +66,18 @@ fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
 }
 
-/// Arguments d'entrée (capture d'écran) + filtre + encodeur pour le buffer.
-pub fn capture_args(cfg: &Config, pipe: Pipeline) -> Vec<String> {
+/// Arguments d'entrée (capture) + filtre + encodeur pour le buffer.
+/// `hwnd` : fenêtre du jeu à capturer seule (0 = l'écran choisi dans les réglages).
+pub fn capture_args(cfg: &Config, pipe: Pipeline, hwnd: u64) -> Vec<String> {
     let enc = pipe.enc;
-    let fps = cfg.fps;
+    // La capture de secours ne tient pas 60 images par seconde.
+    let fps = if pipe.grab == Grab::Gdi { cfg.fps.min(30) } else { cfg.fps };
     let gop = (fps * 2).to_string();
     let br = format!("{}M", cfg.bitrate_mbps);
     let maxbr = format!("{}M", cfg.bitrate_mbps * 3 / 2);
     let buf = format!("{}M", cfg.bitrate_mbps * 2);
     let mut a: Vec<String> = Vec::new();
+    let cursor = if cfg.capture_cursor { 1 } else { 0 };
     let scale = if cfg.height > 0 {
         format!("scale=-2:{}:flags=fast_bilinear,", cfg.height)
     } else {
@@ -83,12 +88,28 @@ pub fn capture_args(cfg: &Config, pipe: Pipeline) -> Vec<String> {
         // Source de test hors Windows (développement).
         a.extend(s(&["-re", "-f", "lavfi", "-i"]));
         a.push(format!("testsrc2=size=1280x720:rate={fps}"));
+    } else if pipe.grab == Grab::Wgc {
+        let source = if hwnd != 0 { format!("hwnd={hwnd}") } else { format!("monitor_idx={}", cfg.monitor) };
+        // Le redimensionnement se fait sur le GPU ; dimensions paires pour l'encodeur.
+        let size = if cfg.height > 0 {
+            let w = (cfg.height * 16 / 9) & !1;
+            format!(":width={w}:height={}:resize_mode=scale_aspect", cfg.height)
+        } else {
+            ":width=-2:height=-2".to_string()
+        };
+        // La source ne livre une image que lorsque l'écran change : `fps` régularise.
+        let grab = format!("gfxcapture={source}:capture_cursor={cursor}:max_framerate={fps}{size},fps={fps}");
+        let filter = match enc {
+            Encoder::Nvenc | Encoder::Amf => grab,
+            Encoder::Qsv => format!("{grab},hwmap=derive_device=qsv,format=qsv"),
+            Encoder::X264 => format!("{grab},hwdownload,format=bgra,format=yuv420p"),
+        };
+        a.extend(s(&["-f", "lavfi", "-i"]));
+        a.push(filter);
     } else if pipe.grab == Grab::Dda {
         let grab = format!(
-            "ddagrab=output_idx={}:framerate={}:draw_mouse={}:output_fmt=8bit",
-            cfg.monitor,
-            fps,
-            if cfg.capture_cursor { 1 } else { 0 }
+            "ddagrab=output_idx={}:framerate={fps}:draw_mouse={cursor}:output_fmt=8bit",
+            cfg.monitor
         );
         // Sans redimensionnement, les images restent sur le GPU (zéro copie).
         let zero_copy = cfg.height == 0;
@@ -103,7 +124,12 @@ pub fn capture_args(cfg: &Config, pipe: Pipeline) -> Vec<String> {
     } else {
         a.extend(s(&["-f", "gdigrab", "-framerate"]));
         a.push(fps.to_string());
-        a.extend(s(&["-draw_mouse", if cfg.capture_cursor { "1" } else { "0" }, "-i", "desktop", "-vf"]));
+        a.extend(s(&["-draw_mouse", if cfg.capture_cursor { "1" } else { "0" }]));
+        // Un seul écran, pas tout le bureau.
+        if let Some((x, y, w, h)) = crate::capture::monitor_rect(cfg.monitor) {
+            a.extend(s(&["-offset_x", &x.to_string(), "-offset_y", &y.to_string(), "-video_size", &format!("{w}x{h}")]));
+        }
+        a.extend(s(&["-i", "desktop", "-vf"]));
         // Dimensions paires obligatoires pour l'encodage 4:2:0.
         let fmt = if enc == Encoder::X264 { "yuv420p" } else { "nv12" };
         a.push(format!("crop=trunc(iw/2)*2:trunc(ih/2)*2,{scale}format={fmt}"));
@@ -139,16 +165,13 @@ fn run_with_timeout(mut cmd: Command, secs: u64) -> bool {
 
 /// Essaie chaque combinaison capture + encodeur sur une seconde réelle, de la
 /// plus légère à la plus compatible. Le détail des essais est écrit dans `log`.
-pub fn detect_pipeline(ffmpeg: &Path, cfg: &Config, log: &Path, only_gdi: bool) -> Option<Pipeline> {
+pub fn detect_pipeline(ffmpeg: &Path, cfg: &Config, log: &Path, skip: usize) -> Option<Pipeline> {
     use std::io::Write;
     if !cfg!(windows) {
-        return Some(Pipeline { grab: Grab::Dda, enc: Encoder::X264 });
+        return Some(Pipeline { grab: Grab::Wgc, enc: Encoder::X264 });
     }
     let _ = std::fs::write(log, "");
-    for grab in [Grab::Dda, Grab::Gdi] {
-        if only_gdi && grab == Grab::Dda {
-            continue;
-        }
+    for grab in [Grab::Wgc, Grab::Dda, Grab::Gdi].into_iter().skip(skip) {
         for enc in [Encoder::Nvenc, Encoder::Amf, Encoder::Qsv, Encoder::X264] {
             let pipe = Pipeline { grab, enc };
             let open = || std::fs::OpenOptions::new().append(true).create(true).open(log);
@@ -157,7 +180,7 @@ pub fn detect_pipeline(ffmpeg: &Path, cfg: &Config, log: &Path, only_gdi: bool) 
             }
             let mut cmd = command(ffmpeg);
             cmd.args(["-loglevel", "error"])
-                .args(capture_args(cfg, pipe))
+                .args(capture_args(cfg, pipe, 0))
                 .args(["-t", "1", "-f", "null", "-"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

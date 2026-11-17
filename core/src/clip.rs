@@ -346,6 +346,17 @@ pub fn prepare_clip(ffmpeg: &Path, clip: &Path) -> Result<ClipInfo, String> {
     clip_info(clip).ok_or_else(|| "Clip introuvable.".to_string())
 }
 
+/// Chemin libre pour une copie montée d'un clip, dans le dossier des clips.
+pub fn copy_path(clips_dir: &Path, name: &str) -> PathBuf {
+    let mut out = clips_dir.join(format!("{name} (copie).mp4"));
+    let mut k = 2;
+    while out.exists() {
+        out = clips_dir.join(format!("{name} (copie {k}).mp4"));
+        k += 1;
+    }
+    out
+}
+
 pub fn delete_clip(path: &Path) -> Result<(), String> {
     std::fs::remove_file(path).map_err(|e| format!("Suppression impossible : {e}"))?;
     let _ = std::fs::remove_dir_all(sidecar_dir(path));

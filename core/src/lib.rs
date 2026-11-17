@@ -41,6 +41,7 @@ pub struct Engine {
     audio: Option<AudioEngine>,
     tmp: PathBuf,
     start_error: Option<String>,
+    game_hwnd: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Engine {
@@ -50,7 +51,7 @@ impl Engine {
         let _ = std::fs::create_dir_all(&tmp);
         let ffmpeg_ok = ffmpeg::is_available(&ffmpeg);
         let _ = std::fs::create_dir_all(&cfg.clips_dir);
-        Engine { cfg, ffmpeg, pipeline: None, ffmpeg_ok, recorder: None, audio: None, tmp, start_error: None }
+        Engine { cfg, ffmpeg, pipeline: None, ffmpeg_ok, recorder: None, audio: None, tmp, start_error: None, game_hwnd: Default::default() }
     }
 
     pub fn log_dir(&self) -> PathBuf {
@@ -69,7 +70,7 @@ impl Engine {
             Some(p) => p,
             None => {
                 let log = self.tmp.join("detect.log");
-                match ffmpeg::detect_pipeline(&self.ffmpeg, &self.cfg, &log, false) {
+                match ffmpeg::detect_pipeline(&self.ffmpeg, &self.cfg, &log, 0) {
                     Some(p) => {
                         self.pipeline = Some(p);
                         p
@@ -83,8 +84,8 @@ impl Engine {
             }
         };
         self.start_error = None;
-        self.audio = Some(AudioEngine::start(&self.cfg, &self.tmp)?);
-        self.recorder = Some(Recorder::start(self.ffmpeg.clone(), self.cfg.clone(), pipe, self.tmp.clone()));
+        self.audio = Some(AudioEngine::start(&self.cfg, &self.tmp, self.game_hwnd.clone())?);
+        self.recorder = Some(Recorder::start(self.ffmpeg.clone(), self.cfg.clone(), pipe, self.tmp.clone(), self.game_hwnd.clone()));
         Ok(())
     }
 
@@ -112,7 +113,8 @@ impl Engine {
             || old.height != c.height
             || old.bitrate_mbps != c.bitrate_mbps
             || old.monitor != c.monitor
-            || old.capture_cursor != c.capture_cursor;
+            || old.capture_cursor != c.capture_cursor
+            || old.capture_window != c.capture_window;
         let restart = capture_changed
             || old.buffer_seconds != c.buffer_seconds
             || old.voice_app != c.voice_app
@@ -153,13 +155,18 @@ impl Engine {
         use std::sync::atomic::Ordering;
         let failing = self.recorder.as_ref().map(|r| r.failures.load(Ordering::Relaxed) >= 3).unwrap_or(false);
         let Some(pipe) = self.pipeline else { return };
-        if !failing || pipe.grab == ffmpeg::Grab::Gdi {
+        let rank = match pipe.grab {
+            ffmpeg::Grab::Wgc => 0,
+            ffmpeg::Grab::Dda => 1,
+            ffmpeg::Grab::Gdi => return,
+        };
+        if !failing {
             return;
         }
         let _ = std::fs::copy(self.tmp.join("recorder.log"), self.tmp.join("recorder-precedent.log"));
         self.stop_buffer();
         let log = self.tmp.join("detect.log");
-        self.pipeline = ffmpeg::detect_pipeline(&self.ffmpeg, &self.cfg, &log, true);
+        self.pipeline = ffmpeg::detect_pipeline(&self.ffmpeg, &self.cfg, &log, rank + 1);
         if self.pipeline.is_some() {
             let _ = self.start_buffer();
         } else {
@@ -175,11 +182,12 @@ impl Engine {
                 .unwrap_or_default()
         };
         format!(
-            "Clipo {}\nCapture : {:?}\n\n--- Détection ---\n{}\n\n--- Enregistreur (avant bascule) ---\n{}\n\n--- Enregistreur ---\n{}",
+            "Clipo {}\nCapture : {:?}\n\n--- Détection ---\n{}\n\n--- Enregistreur (avant bascule) ---\n{}\n\n--- Fenêtre du jeu refusée ---\n{}\n\n--- Enregistreur ---\n{}",
             env!("CARGO_PKG_VERSION"),
             self.pipeline,
             read("detect.log").trim(),
             read("recorder-precedent.log").trim(),
+            read("recorder-fenetre.log").trim(),
             read("recorder.log").trim()
         )
     }

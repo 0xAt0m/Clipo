@@ -17,6 +17,8 @@ pub struct Config {
     /// Index de l'écran capturé.
     pub monitor: u32,
     pub capture_cursor: bool,
+    /// Capturer uniquement la fenêtre du jeu détecté (sinon l'écran entier).
+    pub capture_window: bool,
     /// Exécutable de l'application vocale isolée sur sa propre piste.
     pub voice_app: String,
     /// Jeu isolé sur sa piste : "auto" (application en plein écran) ou nom d'exécutable.
@@ -54,6 +56,7 @@ impl Default for Config {
             bitrate_mbps: 15,
             monitor: 0,
             capture_cursor: true,
+            capture_window: true,
             voice_app: "Discord.exe".into(),
             game_app: "auto".into(),
             mic: "default".into(),

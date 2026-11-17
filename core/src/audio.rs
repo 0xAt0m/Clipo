@@ -6,7 +6,7 @@ use crate::config::Config;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
@@ -159,6 +159,8 @@ pub struct Shared {
     /// PID du jeu isolé (0 = aucun jeu détecté : la piste Jeu prend alors tout sauf le vocal).
     pub game_pid: AtomicU32,
     pub game_name: Mutex<String>,
+    /// Fenêtre du jeu (0 = aucune), partagée avec l'enregistreur vidéo.
+    pub game_hwnd: Arc<AtomicU64>,
     pub mic: String,
 }
 
@@ -172,7 +174,7 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    pub fn start(cfg: &Config, dir: &Path) -> Result<AudioEngine, String> {
+    pub fn start(cfg: &Config, dir: &Path, game_hwnd: Arc<AtomicU64>) -> Result<AudioEngine, String> {
         let epoch = Instant::now();
         let epoch_sys = SystemTime::now();
         let shared = Arc::new(Shared {
@@ -180,6 +182,7 @@ impl AudioEngine {
             voice_pid: AtomicU32::new(0),
             game_pid: AtomicU32::new(0),
             game_name: Mutex::new(String::new()),
+            game_hwnd,
             mic: cfg.mic.clone(),
         });
         let mut kinds = Vec::new();
@@ -309,7 +312,22 @@ pub fn nap(shared: &Shared, total: Duration) {
 const NOT_GAMES: &[&str] = &[
     "explorer", "clipo", "dwm", "chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "vlc",
     "spotify", "applicationframehost", "searchhost", "lockapp", "textinputhost", "shellexperiencehost",
-    "startmenuexperiencehost", "steamwebhelper", "obs64", "mpc-hc64", "wmplayer", "code", "devenv",
+    "startmenuexperiencehost", "obs64", "mpc-hc64", "wmplayer", "code", "devenv", "discord",
+];
+
+/// Lanceurs de jeux : un programme démarré par l'un d'eux est un jeu, même en fenêtré.
+const LAUNCHERS: &[&str] = &[
+    "steam", "epicgameslauncher", "upc", "ubisoftconnect", "uplay", "battle.net", "riotclientservices",
+    "leagueclient", "eadesktop", "ealauncher", "origin", "galaxyclient", "rockstarservice", "launcher",
+    "bethesda.net_launcher", "gamingservices", "xboxpcapp", "playnite.desktopapp", "heroic",
+];
+
+/// Programmes annexes des lanceurs (boutique, overlay, anti-triche…), qui ne sont pas des jeux.
+const LAUNCHER_PARTS: &[&str] = &[
+    "steamwebhelper", "steamservice", "gameoverlayui", "gameoverlayui64", "steamerrorreporter", "epicwebhelper",
+    "uplaywebcore", "upc", "ubisoftconnect", "battle.net", "riotclientux", "riotclientuxrender",
+    "riotclientcrashhandler", "leagueclientux", "leagueclientuxrender", "eadesktop", "eabackgroundservice",
+    "galaxyclient helper", "crashreportclient", "unitycrashhandler64", "easyanticheat", "vgtray", "cefsharp.browsersubprocess",
 ];
 
 fn stem_of(name: &str) -> String {
@@ -317,7 +335,10 @@ fn stem_of(name: &str) -> String {
     n.trim_end_matches(".exe").to_string()
 }
 
-/// Suit l'application vocale et le jeu (processus au premier plan en plein écran).
+/// Suit l'application vocale et le jeu.
+/// Un jeu est l'application au premier plan qui a été démarrée par un lanceur
+/// (Steam, Ubisoft Connect, Epic, Battle.net, Riot, EA…) ou qui occupe tout l'écran.
+/// Il reste « le jeu » tant qu'il tourne, même si l'on passe sur une autre fenêtre.
 fn watch_apps(shared: Arc<Shared>, voice_exe: String, game_exe: String) {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let Ok(mut sys) = System::new() else { return };
@@ -326,6 +347,7 @@ fn watch_apps(shared: Arc<Shared>, voice_exe: String, game_exe: String) {
     let auto = game.is_empty() || game == "auto";
     while !shared.stop.load(Ordering::Relaxed) {
         sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+        let name_of = |pid: u32| sys.process(Pid::from_u32(pid)).map(|p| stem_of(&p.name().to_string_lossy()));
         // Racine d'une application : son parent n'est pas la même application.
         let root_of = |want: &str| -> u32 {
             if want.is_empty() {
@@ -335,35 +357,59 @@ fn watch_apps(shared: Arc<Shared>, voice_exe: String, game_exe: String) {
                 if stem_of(&p.name().to_string_lossy()) != want {
                     continue;
                 }
-                let parent_same = p
-                    .parent()
-                    .and_then(|pp| sys.process(pp))
-                    .map(|pp| stem_of(&pp.name().to_string_lossy()) == want)
-                    .unwrap_or(false);
+                let parent_same = p.parent().and_then(|pp| name_of(pp.as_u32())).map(|n| n == want).unwrap_or(false);
                 if !parent_same {
                     return p.pid().as_u32();
                 }
             }
             0
         };
+        let from_launcher = |pid: u32| -> bool {
+            let mut cur = sys.process(Pid::from_u32(pid)).and_then(|p| p.parent());
+            for _ in 0..6 {
+                let Some(pp) = cur else { return false };
+                match name_of(pp.as_u32()) {
+                    Some(n) if LAUNCHERS.contains(&n.as_str()) => return true,
+                    Some(_) => cur = sys.process(pp).and_then(|p| p.parent()),
+                    None => return false,
+                }
+            }
+            false
+        };
         shared.voice_pid.store(root_of(&voice), Ordering::Relaxed);
 
         let mut pid = shared.game_pid.load(Ordering::Relaxed);
+        let mut hwnd = shared.game_hwnd.load(Ordering::Relaxed);
+        if pid != 0 && sys.process(Pid::from_u32(pid)).is_none() {
+            pid = 0;
+        }
+        let front = crate::capture::foreground();
         if auto {
-            // Le jeu reste « le jeu » tant qu'il tourne, même si l'on passe sur une autre fenêtre.
-            if pid != 0 && sys.process(Pid::from_u32(pid)).is_none() {
-                pid = 0;
-            }
-            if let Some(front) = crate::capture::fullscreen_foreground_pid() {
-                if let Some(p) = sys.process(Pid::from_u32(front)) {
-                    let name = stem_of(&p.name().to_string_lossy());
-                    if front != std::process::id() && name != voice && !NOT_GAMES.contains(&name.as_str()) {
-                        pid = front;
+            if let Some(f) = front {
+                if let Some(name) = name_of(f.pid) {
+                    let excluded = f.pid == std::process::id()
+                        || name == voice
+                        || NOT_GAMES.contains(&name.as_str())
+                        || LAUNCHERS.contains(&name.as_str())
+                        || LAUNCHER_PARTS.contains(&name.as_str());
+                    if !excluded && (f.fullscreen || from_launcher(f.pid)) {
+                        pid = f.pid;
+                        hwnd = f.hwnd;
                     }
                 }
             }
         } else {
             pid = root_of(&game);
+            // La fenêtre du jeu est repérée quand il passe au premier plan.
+            if let Some(f) = front {
+                let same_app = name_of(f.pid).map(|n| n == game).unwrap_or(false);
+                if pid != 0 && same_app {
+                    hwnd = f.hwnd;
+                }
+            }
+        }
+        if pid == 0 || (hwnd != 0 && !crate::capture::window_alive(hwnd)) {
+            hwnd = 0;
         }
         if pid != 0 {
             if let Some(p) = sys.process(Pid::from_u32(pid)) {
@@ -371,8 +417,10 @@ fn watch_apps(shared: Arc<Shared>, voice_exe: String, game_exe: String) {
             }
         }
         shared.game_pid.store(pid, Ordering::Relaxed);
+        shared.game_hwnd.store(hwnd, Ordering::Relaxed);
         nap(&shared, Duration::from_secs(2));
     }
+    shared.game_hwnd.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]

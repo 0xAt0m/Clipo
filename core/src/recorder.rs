@@ -2,12 +2,12 @@
 //! de 2 secondes ; les plus anciens sont supprimés au fur et à mesure.
 
 use crate::config::Config;
-use crate::ffmpeg::{self, Pipeline};
+use crate::ffmpeg::{self, Grab, Pipeline};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
@@ -30,12 +30,12 @@ pub struct Recorder {
     thread: Option<JoinHandle<()>>,
 }
 
-fn spawn(ffmpeg: &Path, cfg: &Config, enc: Pipeline, dir: &Path, run: u32) -> std::io::Result<Child> {
+fn spawn(ffmpeg: &Path, cfg: &Config, enc: Pipeline, dir: &Path, run: u32, hwnd: u64) -> std::io::Result<Child> {
     let log = File::create(dir.join("recorder.log"))?;
     let pattern = dir.join(format!("r{run:04}_%06d.ts"));
     ffmpeg::command(ffmpeg)
         .args(["-loglevel", "warning", "-y"])
-        .args(ffmpeg::capture_args(cfg, enc))
+        .args(ffmpeg::capture_args(cfg, enc, hwnd))
         .args(["-an", "-f", "segment", "-segment_format", "mpegts"])
         .args(["-segment_time", &SEGMENT_SECS.to_string(), "-reset_timestamps", "0"])
         .arg(pattern)
@@ -77,17 +77,33 @@ pub fn list_segments(dir: &Path) -> Vec<Segment> {
 }
 
 impl Recorder {
-    pub fn start(ffmpeg: PathBuf, cfg: Config, enc: Pipeline, dir: PathBuf) -> Recorder {
+    /// `game_hwnd` : fenêtre du jeu détecté (0 = aucune). Quand elle change,
+    /// la capture est relancée sur la nouvelle cible.
+    pub fn start(ffmpeg: PathBuf, cfg: Config, enc: Pipeline, dir: PathBuf, game_hwnd: Arc<AtomicU64>) -> Recorder {
         let stop = Arc::new(AtomicBool::new(false));
         let failures = Arc::new(AtomicU32::new(0));
         let (stop2, failures2, dir2) = (stop.clone(), failures.clone(), dir.clone());
         let thread = std::thread::spawn(move || {
             let keep = Duration::from_secs(cfg.buffer_seconds as u64 + 3 * SEGMENT_SECS + 4);
             let mut run = 0u32;
+            // Fenêtre dont la capture a échoué : on reste alors sur l'écran.
+            let mut bad_hwnd = 0u64;
+            let target = |bad: u64| -> u64 {
+                if !cfg.capture_window || enc.grab != Grab::Wgc {
+                    return 0;
+                }
+                let h = game_hwnd.load(Ordering::Relaxed);
+                let usable = h != 0
+                    && h != bad
+                    && crate::capture::window_alive(h)
+                    && !crate::capture::window_minimized(h);
+                if usable { h } else { 0 }
+            };
             while !stop2.load(Ordering::Relaxed) {
                 run += 1;
                 let started = SystemTime::now();
-                let mut child = match spawn(&ffmpeg, &cfg, enc, &dir2, run) {
+                let hwnd = target(bad_hwnd);
+                let mut child = match spawn(&ffmpeg, &cfg, enc, &dir2, run, hwnd) {
                     Ok(c) => c,
                     Err(_) => {
                         failures2.fetch_add(1, Ordering::Relaxed);
@@ -102,10 +118,22 @@ impl Recorder {
                         quit(&mut child);
                         break;
                     }
+                    // Le jeu est apparu, a disparu ou a été réduit : nouvelle cible.
+                    if target(bad_hwnd) != hwnd {
+                        quit(&mut child);
+                        break;
+                    }
                     if matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
                         let lived = started.elapsed().unwrap_or_default();
                         if lived > Duration::from_secs(10) {
                             failures2.store(0, Ordering::Relaxed);
+                        } else if hwnd != 0 && crate::capture::window_alive(hwnd) {
+                            // Cette fenêtre refuse la capture : on n'insiste pas.
+                            bad_hwnd = hwnd;
+                            let _ = std::fs::copy(dir2.join("recorder.log"), dir2.join("recorder-fenetre.log"));
+                            break;
+                        } else if hwnd != 0 {
+                            break;
                         } else {
                             failures2.fetch_add(1, Ordering::Relaxed);
                         }

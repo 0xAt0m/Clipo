@@ -86,14 +86,14 @@ async function setConfig(patch) {
   refreshStatus();
 }
 
-$('#status').onclick = async () => {
+async function openDiagnostics() {
+  $('#diag-text').textContent = await invoke('get_diagnostics').catch(String);
+  $('#diag').hidden = false;
+}
+$('#status').onclick = () => {
   if (!cfg) return;
   // En cas de souci de capture, la pastille ouvre le diagnostic.
-  if (status && (status.video_trouble || !status.ffmpeg_ok)) {
-    $('#diag-text').textContent = await invoke('get_diagnostics').catch(String);
-    $('#diag').hidden = false;
-    return;
-  }
+  if (status && (status.video_trouble || !status.ffmpeg_ok)) { openDiagnostics(); return; }
   setConfig({ buffer_enabled: !cfg.buffer_enabled });
 };
 $('#diag').onclick = e => { if (e.target.id === 'diag' || e.target.closest('[data-close]')) $('#diag').hidden = true; };
@@ -421,9 +421,10 @@ function renderTimeline() {
     }
     lane.append(d);
   });
-  drawWaves();
+  renderWaveRows();
   const ovs = $('#tl-overlays');
   ovs.textContent = '';
+  $('#tl-ov-row').hidden = ed.project.overlays.length === 0;
   const tot = total();
   for (const o of ed.project.overlays) {
     const b = el('div', 'ovbar' + (ed.sel?.type === 'ov' && ed.sel.id === o.id ? ' sel' : ''), o.type === 'text' ? o.text.split('\n')[0] : 'Image');
@@ -489,22 +490,56 @@ function startTrim(e, id, side) {
   }, () => { if (pushed) changed(); });
 }
 
-// Formes d'onde : une ligne par piste, alignée sur les morceaux de la vidéo.
-function drawWaves() {
+// Une ligne par piste : volume à gauche, forme d'onde alignée sur la vidéo à droite.
+function renderWaveRows() {
   const box = $('#tl-waves');
+  box.textContent = '';
+  const pr = ed.project;
   const names = ed.clip.tracks.length ? ed.clip.tracks.map(t => t.name) : ['Son'];
-  if (box.children.length !== names.length) {
-    box.textContent = '';
-    names.forEach((name, i) => {
-      const row = el('div', 'wave');
-      row.style.setProperty('--c', TRACK_COLORS[i % TRACK_COLORS.length]);
-      row.append(el('canvas'), el('span', null, name));
-      box.append(row);
-    });
-  }
+  names.forEach((name, i) => {
+    const row = el('div', 'tl-row wave-row');
+    row.style.setProperty('--c', TRACK_COLORS[i % TRACK_COLORS.length]);
+    const gut = el('div', 'gut');
+    const title = el('span', 'tname', name);
+    title.title = name;
+    const range = el('input');
+    range.type = 'range'; range.min = 0; range.max = 2; range.step = 0.05; range.value = pr.volumes[i] ?? 1;
+    range.setAttribute('aria-label', `Volume ${name}`);
+    range.title = "Au-delà de 100 %, l'amplification s'entend dans le fichier exporté";
+    const val = el('span', 'tval', `${Math.round((pr.volumes[i] ?? 1) * 100)} %`);
+    let pushed = false;
+    const apply = v => {
+      if (!pushed) { ed.undo.push(JSON.stringify(pr)); pushed = true; }
+      pr.volumes[i] = v;
+      range.value = v;
+      val.textContent = `${Math.round(v * 100)} %`;
+      row.classList.toggle('off', v === 0);
+      applyVolumes();
+      drawWaves();
+      scheduleSave();
+    };
+    range.oninput = () => apply(Number(range.value));
+    range.onchange = () => { pushed = false; };
+    const low = el('button', 'ico'), high = el('button', 'ico');
+    low.innerHTML = ICON_LOW; high.innerHTML = ICON_HIGH;
+    low.title = 'Couper le son'; high.title = 'Volume normal (100 %)';
+    low.setAttribute('aria-label', `Couper ${name}`); high.setAttribute('aria-label', `${name} à 100 %`);
+    low.onclick = () => { apply(0); pushed = false; };
+    high.onclick = () => { apply(1); pushed = false; };
+    row.classList.toggle('off', (pr.volumes[i] ?? 1) === 0);
+    gut.append(title, low, range, high, val);
+    const lane = el('div', 'wave');
+    lane.append(el('canvas'));
+    row.append(gut, lane);
+    box.append(row);
+  });
+  drawWaves();
+}
+
+function drawWaves() {
   const tot = total();
   const dpr = window.devicePixelRatio || 1;
-  [...box.children].forEach((row, i) => {
+  [...$('#tl-waves').querySelectorAll('.wave')].forEach((row, i) => {
     const cv = row.firstChild;
     const W = Math.max(1, Math.round(row.clientWidth * dpr)), H = Math.max(1, Math.round(row.clientHeight * dpr));
     if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
@@ -592,57 +627,31 @@ function renderOverlays() {
   }
 }
 
-function renderTracks() {
-  const box = $('#tracks');
-  box.textContent = '';
-  const pr = ed.project;
-  const names = ed.clip.tracks.length ? ed.clip.tracks.map(t => t.name) : ['Son du clip'];
-  const row = (name, color, get, set, undoable) => {
-    const r = el('div', 'track');
-    r.style.setProperty('--c', color);
-    const title = el('span', 'tname');
-    title.append(el('i', 'sw'), document.createTextNode(name));
-    const val = el('span', 'tval', `${Math.round(get() * 100)} %`);
-    const line = el('div', 'line');
-    const range = el('input');
-    range.type = 'range'; range.min = 0; range.max = 2; range.step = 0.05; range.value = get();
-    range.setAttribute('aria-label', `Volume ${name}`);
-    range.title = "Au-delà de 100 %, l'amplification s'entend dans le fichier exporté";
-    let pushed = false;
-    const apply = v => {
-      if (undoable && !pushed) { ed.undo.push(JSON.stringify(pr)); pushed = true; }
-      set(v);
-      range.value = v;
-      val.textContent = `${Math.round(v * 100)} %`;
-      r.classList.toggle('off', v === 0);
-      applyVolumes();
-      drawWaves();
-      scheduleSave();
-    };
-    range.oninput = () => apply(Number(range.value));
-    range.onchange = () => { pushed = false; };
-    const low = el('button', 'ico'), high = el('button', 'ico');
-    low.innerHTML = ICON_LOW; high.innerHTML = ICON_HIGH;
-    low.title = 'Couper le son'; high.title = 'Volume normal (100 %)';
-    low.setAttribute('aria-label', `Couper ${name}`); high.setAttribute('aria-label', `${name} à 100 %`);
-    low.onclick = () => { apply(0); pushed = false; };
-    high.onclick = () => { apply(1); pushed = false; };
-    r.classList.toggle('off', get() === 0);
-    line.append(low, range, high);
-    r.append(title, val, line);
-    box.append(r);
-  };
-  names.forEach((name, i) => row(name, TRACK_COLORS[i % TRACK_COLORS.length], () => pr.volumes[i] ?? 1, v => { pr.volumes[i] = v; }, true));
-  const sel = ed.sel?.type === 'piece' && pr.pieces.find(p => p.id === ed.sel.id && p.src);
-  if (sel) row('Vidéo insérée', '#8b8b98', () => sel.volume ?? 1, v => { sel.volume = v; }, false);
-}
-
 function renderInspector() {
   const o = ed.sel?.type === 'ov' && ed.project.overlays.find(x => x.id === ed.sel.id);
+  const ext = ed.sel?.type === 'piece' && ed.project.pieces.find(p => p.id === ed.sel.id && p.src);
   const panel = $('#inspector');
-  // Le volume d'une vidéo insérée s'affiche dans le panneau Son.
-  renderTracks();
-  if (!o) { panel.hidden = true; panel.dataset.id = ''; return; }
+  const side = $('#side');
+  if (ext) {
+    // Vidéo insérée : son volume se règle ici.
+    side.hidden = false;
+    panel.hidden = false;
+    if (panel.dataset.id === ext.id) return;
+    panel.dataset.id = ext.id;
+    $('#insp-title').textContent = 'Vidéo insérée';
+    const body = $('#insp-body');
+    body.textContent = '';
+    const f = el('label', 'field');
+    const range = el('input');
+    range.type = 'range'; range.min = 0; range.max = 2; range.step = 0.05; range.value = ext.volume ?? 1;
+    const lab = el('span', null, `Volume : ${Math.round((ext.volume ?? 1) * 100)} %`);
+    range.oninput = () => { ext.volume = Number(range.value); lab.textContent = `Volume : ${Math.round(ext.volume * 100)} %`; applyVolumes(); scheduleSave(); };
+    f.append(lab, range);
+    body.append(f);
+    return;
+  }
+  if (!o) { panel.hidden = true; side.hidden = true; panel.dataset.id = ''; return; }
+  side.hidden = false;
   if (panel.dataset.id === o.id && !panel.hidden) return;
   panel.hidden = false;
   panel.dataset.id = o.id;
@@ -697,7 +706,7 @@ function renderInspector() {
 
 // ── Navigation dans la timeline
 $('#timeline').onpointerdown = e => {
-  if (!ed) return;
+  if (!ed || e.target.closest('.gut')) return;
   const lane = $('#tl-pieces');
   const at = ev => {
     const r = lane.getBoundingClientRect();
@@ -721,9 +730,43 @@ $('#t-image').onclick = addImage;
 $('#t-video').onclick = addVideo;
 $('#ed-back').onclick = closeEditor;
 $('#ed-export').onclick = askExport;
+$('#ed-copy').onclick = () => runExport('original', 'copy');
+
+// Renommer depuis l'éditeur : clic sur le nom.
+$('#ed-title').onclick = () => {
+  if (!ed || $('#ed-title').querySelector('input')) return;
+  const title = $('#ed-title');
+  const input = el('input');
+  input.type = 'text';
+  input.value = ed.clip.name;
+  title.textContent = '';
+  title.append(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const commit = async save => {
+    if (done) return;
+    done = true;
+    const name = input.value.trim();
+    if (!save || !name || name === ed.clip.name) { title.textContent = ed.clip.name; return; }
+    // Windows refuse de renommer un fichier ouvert : on libère le clip, puis on le rouvre.
+    const clip = ed.clip, at = ed.T;
+    await teardownEditor();
+    let next = clip;
+    try { next = await invoke('rename_clip', { path: clip.path, name }); } catch (err) { fail(err); }
+    await openEditor(next);
+    if (ed) seek(Math.min(at, total()));
+  };
+  input.onkeydown = ev => {
+    ev.stopPropagation();
+    if (ev.key === 'Enter') commit(true);
+    if (ev.key === 'Escape') commit(false);
+  };
+  input.onblur = () => commit(true);
+};
 
 window.addEventListener('keydown', e => {
-  if (!ed || !$('#settings').hidden || !$('#exporting').hidden || !$('#export-sheet').hidden || !$('#diag').hidden) return;
+  if (!ed || !$('#settings').hidden || !$('#exporting').hidden || !$('#export-sheet').hidden || !$('#diag').hidden || !$('#share').hidden) return;
   if (e.target.matches('input, textarea, select')) return;
   if (e.code === 'Space') { e.preventDefault(); ed.playing ? pause() : play(); }
   else if (e.code === 'KeyS' && !e.ctrlKey) doSplit();
@@ -743,6 +786,8 @@ async function openEditor(clip) {
   $('#library').hidden = true;
   $('#editor').hidden = false;
   $('#ed-title').textContent = clip.name;
+  $('#ed-title').title = 'Cliquer pour renommer';
+  $('#side').hidden = true;
   video.src = fileSrc(clip.path);
   await new Promise(res => {
     video.onloadedmetadata = res;
@@ -786,17 +831,24 @@ async function openEditor(clip) {
   tick();
 }
 
-function closeEditor() {
+// Sauve le projet et libère tous les fichiers du clip.
+async function teardownEditor() {
   if (!ed) return;
   pause();
   cancelAnimationFrame(ed.raf);
   clearTimeout(ed.saveTimer);
-  invoke('save_project', { clipPath: ed.clip.path, json: JSON.stringify(ed.project) }).catch(() => {});
+  const save = invoke('save_project', { clipPath: ed.clip.path, json: JSON.stringify(ed.project) }).catch(() => {});
   for (const v of ed.ext.values()) { v.removeAttribute('src'); v.load(); v.remove(); }
   for (const a of ed.audios) { a.removeAttribute('src'); a.load(); }
   video.removeAttribute('src');
   video.load();
   ed = null;
+  await save;
+  await new Promise(r => setTimeout(r, 150));
+}
+
+async function closeEditor() {
+  await teardownEditor();
   $('#editor').hidden = true;
   $('#library').hidden = false;
   refreshLibrary();
@@ -847,17 +899,19 @@ function askExport() {
     sheet.hidden = true;
     // Le dernier choix devient le choix par défaut.
     if (choice !== cfg.export_preset) setConfig({ export_preset: choice });
-    doExport(choice);
+    runExport(choice, 'share');
   };
   $('#export-go').focus();
 }
 $('#export-sheet').onclick = e => { if (e.target.id === 'export-sheet' || e.target.closest('[data-close]')) $('#export-sheet').hidden = true; };
 
-async function doExport(preset) {
+// kind : 'share' = fichier temporaire à glisser ailleurs ; 'copy' = nouvelle copie dans la bibliothèque.
+async function runExport(preset, kind) {
   pause();
   const W = video.videoWidth & ~1, H = video.videoHeight & ~1;
   const tot = total();
   const pr = ed.project;
+  $('#export-title').textContent = kind === 'copy' ? 'Enregistrement de la copie…' : 'Préparation du fichier…';
   $('#export-bar').style.width = '0%';
   $('#exporting').hidden = false;
   try {
@@ -870,28 +924,76 @@ async function doExport(preset) {
       if (!dataUrl) continue;
       overlays.push({ png: await invoke('write_overlay', { dataUrl }), start, end });
     }
-    const path = ed.clip.path;
-    const sep = cfg.clips_dir.includes('\\') ? '\\' : '/';
-    const d = new Date();
-    const stamp = [d.getHours(), d.getMinutes(), d.getSeconds()].map(x => String(x).padStart(2, '0')).join('');
     const target = PRESETS[preset];
     const project = {
-      main: path,
+      main: ed.clip.path,
       track_count: ed.clip.tracks.length,
       mix_first: ed.clip.mix_first,
       volumes: pr.volumes.slice(),
       pieces: pr.pieces.map(p => ({ src: p.src || null, start: p.start, end: p.end, volume: p.volume ?? 1 })),
       overlays,
-      output: `${cfg.clips_dir.replace(/[\\/]+$/, '')}${sep}${ed.clip.name}_${target ? target + 'Mo' : 'montage'}_${stamp}.mp4`,
+      output: await invoke('plan_output', { kind, name: ed.clip.name }),
       target_mb: target,
     };
     const out = await invoke('export_project', { project });
-    toast(target ? `Exporté en ${target} Mo maximum.` : 'Montage exporté.', { action: { label: 'Afficher', run: () => invoke('reveal', { path: out }) } });
+    $('#exporting').hidden = true;
+    if (kind === 'copy') {
+      const name = out.split(/[\\/]/).pop();
+      toast(`Copie enregistrée : ${name}`, { action: { label: 'Afficher', run: () => invoke('reveal', { path: out }) } });
+    } else {
+      showShare(out);
+    }
   } catch (e) {
     fail(e);
   }
   $('#exporting').hidden = true;
 }
+
+// Fenêtre de partage : le fichier se glisse directement dans Discord.
+let shareIcon = null;
+function dragIcon() {
+  if (shareIcon) return shareIcon;
+  const c = document.createElement('canvas');
+  c.width = 96; c.height = 64;
+  const g = c.getContext('2d');
+  g.fillStyle = '#ff5c38';
+  g.beginPath(); g.roundRect(0, 0, 96, 64, 10); g.fill();
+  g.fillStyle = '#fff';
+  g.beginPath(); g.moveTo(40, 20); g.lineTo(40, 44); g.lineTo(60, 32); g.closePath(); g.fill();
+  return (shareIcon = c.toDataURL('image/png'));
+}
+async function showShare(path) {
+  const size = await invoke('file_size', { path }).catch(() => 0);
+  const name = path.split(/[\\/]/).pop();
+  $('#share-name').textContent = name;
+  $('#share-size').textContent = `${(size / 1e6).toFixed(1).replace('.', ',')} Mo`;
+  const v = $('#share-video');
+  v.src = fileSrc(path);
+  const tile = $('#share-file');
+  tile.onpointerdown = e => {
+    if (e.button !== 0) return;
+    const x0 = e.clientX, y0 = e.clientY;
+    const move = ev => {
+      if (Math.abs(ev.clientX - x0) + Math.abs(ev.clientY - y0) < 6) return;
+      stop();
+      v.pause();
+      invoke('plugin:drag|start_drag', { item: [path], image: dragIcon(), onEvent: new TAURI.core.Channel() })
+        .catch(err => fail(`Glisser-déposer indisponible : ${err}`));
+    };
+    const stop = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', stop); };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', stop);
+  };
+  $('#share-reveal').onclick = () => invoke('reveal', { path });
+  $('#share').hidden = false;
+}
+$('#share').onclick = e => {
+  if (e.target.id === 'share' || e.target.closest('[data-close]')) {
+    const v = $('#share-video');
+    v.pause(); v.removeAttribute('src'); v.load();
+    $('#share').hidden = true;
+  }
+};
 
 // ───────────────────────────── Réglages ─────────────────────────────
 function fillSettings() {
@@ -909,6 +1011,7 @@ function fillSettings() {
   $('#s-bitrate-val').textContent = `${cfg.bitrate_mbps} Mbit/s`;
   $('#s-monitor').value = String(cfg.monitor);
   $('#s-cursor').checked = cfg.capture_cursor;
+  $('#s-window').checked = cfg.capture_window;
   $('#s-autostart').checked = cfg.autostart;
   $('#s-offset').value = cfg.audio_offset_ms;
   $('#s-offset-val').textContent = `${cfg.audio_offset_ms} ms`;
@@ -959,6 +1062,8 @@ function bindSettings() {
   on('#s-bitrate', 'bitrate_mbps', e => Number(e.value));
   on('#s-monitor', 'monitor', e => Number(e.value));
   on('#s-cursor', 'capture_cursor', e => e.checked);
+  on('#s-window', 'capture_window', e => e.checked);
+  $('#s-diag').onclick = e => { e.preventDefault(); openDiagnostics(); };
   on('#s-autostart', 'autostart', e => e.checked);
   on('#s-offset', 'audio_offset_ms', e => Number(e.value));
   on('#s-gameapp', 'game_app', e => e.value.trim() || 'auto');

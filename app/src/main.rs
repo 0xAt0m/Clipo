@@ -286,6 +286,28 @@ fn export_project(app: AppHandle, state: State<AppState>, project: Project) -> R
     result.map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Chemin de sortie d'un export : « share » = fichier temporaire à partager
+/// (effacé au prochain lancement), « copy » = nouvelle copie dans le dossier des clips.
+#[tauri::command(async)]
+fn plan_output(state: State<AppState>, kind: String, name: String) -> Result<String, String> {
+    let e = state.engine.lock().unwrap();
+    let path = if kind == "share" {
+        let dir = e.log_dir().join("partage");
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        dir.join(format!("{name}.mp4"))
+    } else {
+        let dir = PathBuf::from(&e.cfg.clips_dir);
+        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
+        clip::copy_path(&dir, &name)
+    };
+    Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command(async)]
+fn file_size(path: String) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
 #[tauri::command(async)]
 fn list_mics() -> Vec<String> {
     clipo_core::capture::list_mics()
@@ -342,6 +364,7 @@ fn main() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main(app)))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_drag::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--minimized"]),
@@ -374,7 +397,9 @@ fn main() {
             prepare_clip,
             waveform,
             get_diagnostics,
-            test_sound
+            test_sound,
+            plan_output,
+            file_size
         ])
         .setup(|app| {
             let handle = app.handle().clone();

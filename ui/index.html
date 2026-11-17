@@ -34,7 +34,8 @@
     <button id="ed-back" class="btn ghost">← Clips</button>
     <h1 id="ed-title"></h1>
     <div class="spacer"></div>
-    <button id="ed-export" class="btn primary">Exporter</button>
+    <button id="ed-copy" class="btn" title="Crée un nouveau clip avec le montage ; l'original n'est pas modifié">Enregistrer une copie</button>
+    <button id="ed-export" class="btn primary">Partager</button>
   </div>
   <div class="ed-body">
     <div class="stage-wrap">
@@ -43,11 +44,7 @@
         <div id="overlays"></div>
       </div>
     </div>
-    <aside class="side">
-      <section id="tracks-panel">
-        <h3>Son</h3>
-        <div id="tracks"></div>
-      </section>
+    <aside class="side" id="side" hidden>
       <section id="inspector" hidden>
         <h3 id="insp-title">Calque</h3>
         <div id="insp-body"></div>
@@ -67,9 +64,9 @@
     <button id="t-video" class="btn">+ Vidéo</button>
   </div>
   <div id="timeline" class="timeline">
-    <div id="tl-pieces" class="lane pieces"></div>
+    <div class="tl-row"><div class="gut"><span class="tname">Vidéo</span></div><div id="tl-pieces" class="lane pieces"></div></div>
     <div id="tl-waves"></div>
-    <div id="tl-overlays" class="lane ovs"></div>
+    <div class="tl-row" id="tl-ov-row" hidden><div class="gut"><span class="tname">Calques</span></div><div id="tl-overlays" class="lane ovs"></div></div>
     <div id="playhead"></div>
   </div>
   <p class="hint">Glissez un bord d'un morceau pour ajuster sa durée. Pour retirer un passage : <b>Couper</b> avant, <b>Couper</b> après, cliquer le morceau, <b>Supprimer</b>.</p>
@@ -111,6 +108,7 @@
       <label class="row"><span>Images par seconde</span>
         <select id="s-fps"><option value="60">60</option><option value="30">30</option></select></label>
       <label class="row"><span>Qualité <small id="s-bitrate-val"></small></span><input type="range" id="s-bitrate" min="4" max="50" step="1"></label>
+      <label class="row"><span>Capturer la fenêtre du jeu <small>sinon, ou sans jeu détecté : l'écran ci-dessous</small></span><input type="checkbox" id="s-window"></label>
       <label class="row"><span>Écran</span>
         <select id="s-monitor"><option value="0">Principal</option><option value="1">Écran 2</option><option value="2">Écran 3</option></select></label>
       <label class="row"><span>Afficher le curseur</span><input type="checkbox" id="s-cursor"></label>
@@ -118,6 +116,7 @@
       <h3>Application</h3>
       <label class="row"><span>Lancer avec Windows <small>réduit dans la zone de notification</small></span><input type="checkbox" id="s-autostart"></label>
       <label class="row"><span>Décalage du son <small id="s-offset-val"></small></span><input type="range" id="s-offset" min="-300" max="300" step="10"></label>
+      <div class="row"><span>Diagnostic <small>journal de la capture, à copier en cas de souci</small></span><button id="s-diag" class="btn">Ouvrir</button></div>
       <p class="note" id="s-encoder"></p>
     </div>
   </div>
@@ -126,14 +125,28 @@
 <!-- Choix de la compression -->
 <div id="export-sheet" class="modal" hidden>
   <div class="sheet small">
-    <h2>Exporter</h2>
+    <h2>Partager</h2>
     <div class="presets">
       <button class="preset" data-preset="original"><b>Original</b><small>Qualité maximale</small></button>
       <button class="preset" data-preset="100"><b>100 Mo</b><small>Très bonne qualité</small></button>
       <button class="preset" data-preset="50"><b>50 Mo</b><small>Bonne qualité</small></button>
       <button class="preset" data-preset="10"><b>10 Mo</b><small>Partage Discord</small></button>
     </div>
-    <div class="actions-row"><button class="btn" data-close>Annuler</button><button id="export-go" class="btn primary">Exporter</button></div>
+    <div class="actions-row"><button class="btn" data-close>Annuler</button><button id="export-go" class="btn primary">Préparer le fichier</button></div>
+  </div>
+</div>
+
+<!-- Fichier prêt à partager -->
+<div id="share" class="modal" hidden>
+  <div class="sheet small share">
+    <h2>Fichier prêt</h2>
+    <div id="share-file" title="Maintenir le clic et glisser vers Discord">
+      <video id="share-video" muted playsinline preload="metadata"></video>
+      <div class="share-meta"><b id="share-name"></b><span id="share-size"></span></div>
+      <p>Glissez ce fichier dans Discord</p>
+    </div>
+    <p class="note">Fichier temporaire : il n'est pas ajouté à vos clips.</p>
+    <div class="actions-row"><button id="share-reveal" class="btn">Afficher dans le dossier</button><button class="btn primary" data-close>Fermer</button></div>
   </div>
 </div>
 
@@ -151,7 +164,7 @@
 <!-- Export -->
 <div id="exporting" class="modal" hidden>
   <div class="sheet small">
-    <h2>Export en cours…</h2>
+    <h2 id="export-title">Export en cours…</h2>
     <div class="bar"><i id="export-bar"></i></div>
   </div>
 </div>

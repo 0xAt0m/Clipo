@@ -46,6 +46,17 @@ la garde comme « jeu » tant qu'elle tourne. La musique ou le navigateur à cô
 enregistrés. Si la détection se trompe, indiquez le nom de l'exécutable dans Réglages → Son → Jeu.
 Tant qu'aucun jeu n'est détecté, la piste reçoit tout le son du PC sauf le vocal.
 
+### Ce qui est filmé
+
+Quand un jeu est détecté, Clipo ne filme que sa fenêtre (pas le second écran). Un jeu est
+l'application au premier plan lancée par Steam, Ubisoft Connect, Epic, Battle.net, Riot, EA… ou
+occupant tout l'écran. Sans jeu détecté, c'est l'écran choisi dans Réglages → Vidéo qui est filmé.
+
+### Partager et enregistrer une copie
+
+**Partager** prépare un fichier compressé temporaire et l'affiche dans une fenêtre : glissez-le
+dans Discord. **Enregistrer une copie** crée un nouveau clip avec le montage, sans toucher à l'original.
+
 ### Son de confirmation
 
 Deux notes brèves, la seconde un ton plus haut. Réglages → Clip permet de le couper ou de le
