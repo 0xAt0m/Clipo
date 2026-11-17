@@ -36,22 +36,56 @@ impl Encoder {
     }
 }
 
+/// Méthode de capture de l'écran.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub enum Grab {
+    /// Desktop Duplication : les images restent sur le GPU.
+    Dda,
+    /// GDI : plus lourd, mais fonctionne partout (secours).
+    Gdi,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct Pipeline {
+    pub grab: Grab,
+    pub enc: Encoder,
+}
+
+impl Pipeline {
+    pub fn label(&self) -> String {
+        match self.grab {
+            Grab::Dda => self.enc.label().to_string(),
+            Grab::Gdi => format!("{} (capture de secours)", self.enc.label()),
+        }
+    }
+}
+
 fn s(v: &[&str]) -> Vec<String> {
     v.iter().map(|x| x.to_string()).collect()
 }
 
 /// Arguments d'entrée (capture d'écran) + filtre + encodeur pour le buffer.
-pub fn capture_args(cfg: &Config, enc: Encoder) -> Vec<String> {
+pub fn capture_args(cfg: &Config, pipe: Pipeline) -> Vec<String> {
+    let enc = pipe.enc;
     let fps = cfg.fps;
     let gop = (fps * 2).to_string();
     let br = format!("{}M", cfg.bitrate_mbps);
     let maxbr = format!("{}M", cfg.bitrate_mbps * 3 / 2);
     let buf = format!("{}M", cfg.bitrate_mbps * 2);
     let mut a: Vec<String> = Vec::new();
+    let scale = if cfg.height > 0 {
+        format!("scale=-2:{}:flags=fast_bilinear,", cfg.height)
+    } else {
+        String::new()
+    };
 
-    if cfg!(windows) {
+    if !cfg!(windows) {
+        // Source de test hors Windows (développement).
+        a.extend(s(&["-re", "-f", "lavfi", "-i"]));
+        a.push(format!("testsrc2=size=1280x720:rate={fps}"));
+    } else if pipe.grab == Grab::Dda {
         let grab = format!(
-            "ddagrab=output_idx={}:framerate={}:draw_mouse={}",
+            "ddagrab=output_idx={}:framerate={}:draw_mouse={}:output_fmt=8bit",
             cfg.monitor,
             fps,
             if cfg.capture_cursor { 1 } else { 0 }
@@ -61,59 +95,83 @@ pub fn capture_args(cfg: &Config, enc: Encoder) -> Vec<String> {
         let filter = match (enc, zero_copy) {
             (Encoder::Nvenc, true) | (Encoder::Amf, true) => grab,
             (Encoder::Qsv, true) => format!("{grab},hwmap=derive_device=qsv,format=qsv"),
-            (Encoder::X264, true) => format!("{grab},hwdownload,format=bgra"),
-            (_, false) => format!(
-                "{grab},hwdownload,format=bgra,scale=-2:{}:flags=fast_bilinear",
-                cfg.height
-            ),
+            (Encoder::X264, _) => format!("{grab},hwdownload,format=bgra,{scale}format=yuv420p"),
+            (_, false) => format!("{grab},hwdownload,format=bgra,{scale}format=nv12"),
         };
         a.extend(s(&["-f", "lavfi", "-i"]));
         a.push(filter);
     } else {
-        // Source de test hors Windows (développement).
-        a.extend(s(&["-re", "-f", "lavfi", "-i"]));
-        a.push(format!("testsrc2=size=1280x720:rate={fps}"));
+        a.extend(s(&["-f", "gdigrab", "-framerate"]));
+        a.push(fps.to_string());
+        a.extend(s(&["-draw_mouse", if cfg.capture_cursor { "1" } else { "0" }, "-i", "desktop", "-vf"]));
+        // Dimensions paires obligatoires pour l'encodage 4:2:0.
+        let fmt = if enc == Encoder::X264 { "yuv420p" } else { "nv12" };
+        a.push(format!("crop=trunc(iw/2)*2:trunc(ih/2)*2,{scale}format={fmt}"));
     }
 
     match enc {
-        Encoder::Nvenc => a.extend(s(&[
-            "-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-bf", "0", "-strict_gop", "1",
-        ])),
+        Encoder::Nvenc => a.extend(s(&["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-bf", "0"])),
         Encoder::Amf => a.extend(s(&[
             "-c:v", "h264_amf", "-usage", "transcoding", "-quality", "speed", "-rc", "vbr_peak",
             "-bf", "0",
         ])),
         Encoder::Qsv => a.extend(s(&["-c:v", "h264_qsv", "-preset", "veryfast", "-bf", "0"])),
-        Encoder::X264 => a.extend(s(&[
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-pix_fmt",
-            "yuv420p",
-        ])),
+        Encoder::X264 => a.extend(s(&["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency"])),
     }
     a.extend(s(&["-b:v", &br, "-maxrate", &maxbr, "-bufsize", &buf, "-g", &gop]));
     a
 }
 
-/// Essaie chaque encodeur sur une demi-seconde de capture réelle.
-pub fn detect_encoder(ffmpeg: &Path, cfg: &Config) -> Encoder {
-    if !cfg!(windows) {
-        return Encoder::X264;
-    }
-    for enc in [Encoder::Nvenc, Encoder::Amf, Encoder::Qsv] {
-        let ok = command(ffmpeg)
-            .args(["-loglevel", "error"])
-            .args(capture_args(cfg, enc))
-            .args(["-t", "0.5", "-f", "null", "-"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|st| st.success())
-            .unwrap_or(false);
-        if ok {
-            return enc;
+/// Lance une commande avec un délai maximal ; vrai si elle réussit.
+fn run_with_timeout(mut cmd: Command, secs: u64) -> bool {
+    let Ok(mut child) = cmd.spawn() else { return false };
+    for _ in 0..secs * 20 {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => break,
         }
     }
-    Encoder::X264
+    let _ = child.kill();
+    let _ = child.wait();
+    false
+}
+
+/// Essaie chaque combinaison capture + encodeur sur une seconde réelle, de la
+/// plus légère à la plus compatible. Le détail des essais est écrit dans `log`.
+pub fn detect_pipeline(ffmpeg: &Path, cfg: &Config, log: &Path, only_gdi: bool) -> Option<Pipeline> {
+    use std::io::Write;
+    if !cfg!(windows) {
+        return Some(Pipeline { grab: Grab::Dda, enc: Encoder::X264 });
+    }
+    let _ = std::fs::write(log, "");
+    for grab in [Grab::Dda, Grab::Gdi] {
+        if only_gdi && grab == Grab::Dda {
+            continue;
+        }
+        for enc in [Encoder::Nvenc, Encoder::Amf, Encoder::Qsv, Encoder::X264] {
+            let pipe = Pipeline { grab, enc };
+            let open = || std::fs::OpenOptions::new().append(true).create(true).open(log);
+            if let Ok(mut f) = open() {
+                let _ = writeln!(f, "=== essai {grab:?} + {enc:?}");
+            }
+            let mut cmd = command(ffmpeg);
+            cmd.args(["-loglevel", "error"])
+                .args(capture_args(cfg, pipe))
+                .args(["-t", "1", "-f", "null", "-"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(open().map(Stdio::from).unwrap_or_else(|_| Stdio::null()));
+            let ok = run_with_timeout(cmd, 12);
+            if let Ok(mut f) = open() {
+                let _ = writeln!(f, "=== {}", if ok { "OK" } else { "échec" });
+            }
+            if ok {
+                return Some(pipe);
+            }
+        }
+    }
+    None
 }
 
 pub fn is_available(ffmpeg: &Path) -> bool {
@@ -135,6 +193,9 @@ pub struct MediaInfo {
     pub fps: f64,
     pub audio_streams: u32,
     pub has_video: bool,
+    /// Titre de chaque piste audio (vide si absent).
+    #[serde(default)]
+    pub audio_titles: Vec<String>,
 }
 
 /// Analyse un fichier en lisant la sortie de `ffmpeg -i` (évite d'embarquer ffprobe).
@@ -147,8 +208,12 @@ pub fn probe(ffmpeg: &Path, file: &Path) -> Result<MediaInfo, String> {
         .map_err(|e| format!("ffmpeg introuvable : {e}"))?;
     let text = String::from_utf8_lossy(&out.stderr);
     let mut info = MediaInfo::default();
+    let mut in_audio = false;
     for line in text.lines() {
         let l = line.trim();
+        if l.starts_with("Stream #") {
+            in_audio = false;
+        }
         if let Some(rest) = l.strip_prefix("Duration: ") {
             let d = rest.split(',').next().unwrap_or("");
             let p: Vec<&str> = d.split(':').collect();
@@ -160,6 +225,17 @@ pub fn probe(ffmpeg: &Path, file: &Path) -> Result<MediaInfo, String> {
             }
         } else if l.starts_with("Stream #") && l.contains("Audio:") {
             info.audio_streams += 1;
+            info.audio_titles.push(String::new());
+            in_audio = true;
+        } else if in_audio && (l.starts_with("title") || l.starts_with("handler_name")) {
+            if let (Some((key, v)), Some(last)) = (l.split_once(':'), info.audio_titles.last_mut()) {
+                let v = v.trim();
+                // « title » prime sur « handler_name » ; les noms génériques sont ignorés.
+                let generic = v.is_empty() || v == "SoundHandler" || v.starts_with("ISO Media");
+                if !generic && (key.trim() == "title" || last.is_empty()) {
+                    *last = v.to_string();
+                }
+            }
         } else if l.starts_with("Stream #") && l.contains("Video:") && !info.has_video {
             // Les images fixes (png/jpg) comptent comme vidéo d'une image.
             info.has_video = true;
@@ -195,4 +271,32 @@ pub fn log_tail(path: &Path, lines: usize) -> String {
         .unwrap_or_default();
     let v: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     v[v.len().saturating_sub(lines)..].join("\n")
+}
+
+/// Enveloppe sonore d'une piste : `per_sec` valeurs (0-255) par seconde.
+pub fn waveform(ffmpeg: &Path, file: &Path, stream: u32, per_sec: u32) -> Result<Vec<u8>, String> {
+    const RATE: u32 = 8000;
+    let out = command(ffmpeg)
+        .args(["-loglevel", "error", "-i"])
+        .arg(file)
+        .args(["-map", &format!("0:a:{stream}"), "-ac", "1", "-ar", &RATE.to_string(), "-f", "s16le", "-"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|e| format!("ffmpeg introuvable : {e}"))?;
+    let win = (RATE / per_sec.max(1)) as usize * 2;
+    Ok(out
+        .stdout
+        .chunks(win)
+        .map(|c| {
+            let peak = c
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs())
+                .max()
+                .unwrap_or(0) as f32
+                / 32768.0;
+            // Courbe adoucie : les sons faibles restent visibles.
+            (peak.sqrt() * 255.0).min(255.0) as u8
+        })
+        .collect())
 }

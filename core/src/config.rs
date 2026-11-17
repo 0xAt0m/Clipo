@@ -19,6 +19,8 @@ pub struct Config {
     pub capture_cursor: bool,
     /// Exécutable de l'application vocale isolée sur sa propre piste.
     pub voice_app: String,
+    /// Jeu isolé sur sa piste : "auto" (application en plein écran) ou nom d'exécutable.
+    pub game_app: String,
     /// "default", "none" ou nom du périphérique.
     pub mic: String,
     pub record_game: bool,
@@ -28,6 +30,13 @@ pub struct Config {
     pub buffer_enabled: bool,
     /// Décalage appliqué aux pistes audio (ms, positif = audio retardé).
     pub audio_offset_ms: i32,
+    /// Fichier .wav joué à l'enregistrement d'un clip (vide = son intégré).
+    pub sound_file: String,
+    pub sound_enabled: bool,
+    /// Dernier niveau de compression choisi à l'export : "original", "10", "50", "100".
+    pub export_preset: String,
+    /// Dossiers supplémentaires affichés dans la bibliothèque (clips SteelSeries, etc.).
+    pub extra_dirs: Vec<String>,
 }
 
 impl Default for Config {
@@ -46,6 +55,7 @@ impl Default for Config {
             monitor: 0,
             capture_cursor: true,
             voice_app: "Discord.exe".into(),
+            game_app: "auto".into(),
             mic: "default".into(),
             record_game: true,
             record_voice: true,
@@ -53,6 +63,10 @@ impl Default for Config {
             autostart: false,
             buffer_enabled: true,
             audio_offset_ms: 0,
+            sound_file: String::new(),
+            sound_enabled: true,
+            export_preset: "100".into(),
+            extra_dirs: Vec::new(),
         }
     }
 }
@@ -90,6 +104,12 @@ impl Config {
         self.fps = if self.fps >= 60 { 60 } else { 30 };
         self.bitrate_mbps = self.bitrate_mbps.clamp(2, 60);
         self.audio_offset_ms = self.audio_offset_ms.clamp(-1000, 1000);
+        if self.game_app.trim().is_empty() {
+            self.game_app = "auto".into();
+        }
+        if !["original", "10", "50", "100"].contains(&self.export_preset.as_str()) {
+            self.export_preset = "100".into();
+        }
         if self.hotkey.trim().is_empty() {
             self.hotkey = "Alt+F10".into();
         }

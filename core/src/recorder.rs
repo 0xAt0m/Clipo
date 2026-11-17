@@ -2,7 +2,7 @@
 //! de 2 secondes ; les plus anciens sont supprimés au fur et à mesure.
 
 use crate::config::Config;
-use crate::ffmpeg::{self, Encoder};
+use crate::ffmpeg::{self, Pipeline};
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ pub struct Recorder {
     thread: Option<JoinHandle<()>>,
 }
 
-fn spawn(ffmpeg: &Path, cfg: &Config, enc: Encoder, dir: &Path, run: u32) -> std::io::Result<Child> {
+fn spawn(ffmpeg: &Path, cfg: &Config, enc: Pipeline, dir: &Path, run: u32) -> std::io::Result<Child> {
     let log = File::create(dir.join("recorder.log"))?;
     let pattern = dir.join(format!("r{run:04}_%06d.ts"));
     ffmpeg::command(ffmpeg)
@@ -77,7 +77,7 @@ pub fn list_segments(dir: &Path) -> Vec<Segment> {
 }
 
 impl Recorder {
-    pub fn start(ffmpeg: PathBuf, cfg: Config, enc: Encoder, dir: PathBuf) -> Recorder {
+    pub fn start(ffmpeg: PathBuf, cfg: Config, enc: Pipeline, dir: PathBuf) -> Recorder {
         let stop = Arc::new(AtomicBool::new(false));
         let failures = Arc::new(AtomicU32::new(0));
         let (stop2, failures2, dir2) = (stop.clone(), failures.clone(), dir.clone());

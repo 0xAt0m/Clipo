@@ -46,6 +46,9 @@ pub struct Project {
     #[serde(default)]
     pub overlays: Vec<Overlay>,
     pub output: String,
+    /// Taille maximale du fichier en Mo (None = qualité d'origine).
+    #[serde(default)]
+    pub target_mb: Option<u32>,
 }
 
 fn is_image(path: &str) -> bool {
@@ -54,8 +57,30 @@ fn is_image(path: &str) -> bool {
 }
 
 pub struct Plan {
+    /// Entrées, filtres et sélection des flux.
     pub args: Vec<String>,
+    /// Encodage vidéo (sans le numéro de passe).
+    pub video: Vec<String>,
+    pub audio: Vec<String>,
+    /// Vrai si l'encodage se fait en deux passes (taille cible).
+    pub two_pass: bool,
     pub duration: f64,
+}
+
+/// Réglages d'encodage pour tenir dans `mb` mégaoctets : (débit vidéo kbit/s, débit audio, hauteur max, ips max).
+fn budget(mb: u32, duration: f64) -> (u32, u32, u32, f64) {
+    // Marge de 6 % pour l'enrobage du conteneur.
+    let total_kbps = (mb as f64 * 8000.0 * 0.94) / duration.max(1.0);
+    let audio = if total_kbps < 700.0 { 64 } else if total_kbps < 2500.0 { 96 } else { 128 };
+    let video = (total_kbps - audio as f64).max(80.0) as u32;
+    let (height, fps) = match video {
+        0..=699 => (480, 30.0),
+        700..=1799 => (720, 30.0),
+        1800..=3999 => (720, 60.0),
+        4000..=7999 => (1080, 60.0),
+        _ => (4320, 120.0),
+    };
+    (video, audio, height, fps)
 }
 
 /// Construit la commande ffmpeg. `probe` renseigne chaque fichier source.
@@ -67,9 +92,18 @@ pub fn plan(p: &Project, probe: &dyn Fn(&str) -> Result<MediaInfo, String>) -> R
     if !main.has_video || main.width == 0 {
         return Err("Le clip principal n'a pas de piste vidéo lisible.".into());
     }
-    let w = main.width & !1;
-    let h = main.height & !1;
-    let fps = if main.fps > 1.0 { main.fps.min(120.0) } else { 60.0 };
+    let mut w = main.width & !1;
+    let mut h = main.height & !1;
+    let mut fps = if main.fps > 1.0 { main.fps.min(120.0) } else { 60.0 };
+    let planned: f64 = p.pieces.iter().map(|x| (x.end - x.start).max(0.0)).sum();
+    let size = p.target_mb.map(|mb| budget(mb, planned));
+    if let Some((_, _, max_h, max_fps)) = size {
+        if h > max_h {
+            w = ((w as f64 * max_h as f64 / h as f64) as u32) & !1;
+            h = max_h;
+        }
+        fps = fps.min(max_fps);
+    }
 
     let mut inputs: Vec<String> = vec!["-i".into(), p.main.clone()];
     let mut next_input = 1usize;
@@ -167,35 +201,31 @@ pub fn plan(p: &Project, probe: &dyn Fn(&str) -> Result<MediaInfo, String>) -> R
 
     let mut args: Vec<String> = vec!["-y".into()];
     args.extend(inputs);
-    args.extend([
-        "-filter_complex".into(),
-        fc.join(";"),
-        "-map".into(),
-        format!("[{vlabel}]"),
-        "-map".into(),
-        "[ac]".into(),
-    ]);
-    for s in [
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p", "-c:a", "aac",
-        "-b:a", "192k", "-movflags", "+faststart", "-t",
-    ] {
-        args.push(s.into());
-    }
-    args.push(format!("{total:.3}"));
-    args.push(p.output.clone());
-    Ok(Plan { args, duration: total })
+    args.extend(["-filter_complex".into(), fc.join(";"), "-map".into(), format!("[{vlabel}]")]);
+    let sv = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+    let (video, audio) = match size {
+        Some((vk, ak, _, _)) => (
+            [sv(&["-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p", "-b:v"]), vec![format!("{vk}k")]].concat(),
+            [sv(&["-c:a", "aac", "-b:a"]), vec![format!("{ak}k")]].concat(),
+        ),
+        None => (
+            sv(&["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"]),
+            sv(&["-c:a", "aac", "-b:a", "192k"]),
+        ),
+    };
+    Ok(Plan { args, video, audio, two_pass: size.is_some(), duration: total })
 }
 
-/// Lance l'export et rapporte la progression (0..1).
-pub fn run(ffmpeg_path: &Path, p: &Project, log: &Path, progress: &dyn Fn(f64)) -> Result<PathBuf, String> {
-    let plan = plan(p, &|f| ffmpeg::probe(ffmpeg_path, Path::new(f)))?;
-    let out = PathBuf::from(&p.output);
-    if let Some(d) = out.parent() {
-        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
-    }
+fn run_pass(
+    ffmpeg_path: &Path,
+    args: &[String],
+    log: &Path,
+    duration: f64,
+    progress: &dyn Fn(f64),
+) -> Result<(), String> {
     let mut child = ffmpeg::command(ffmpeg_path)
         .args(["-loglevel", "error", "-nostats", "-progress", "pipe:1"])
-        .args(&plan.args)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(File::create(log).map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
@@ -205,15 +235,55 @@ pub fn run(ffmpeg_path: &Path, p: &Project, log: &Path, progress: &dyn Fn(f64)) 
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Some(v) = line.strip_prefix("out_time_us=").or_else(|| line.strip_prefix("out_time_ms=")) {
                 if let Ok(us) = v.trim().parse::<f64>() {
-                    progress((us / 1e6 / plan.duration).clamp(0.0, 1.0));
+                    progress((us / 1e6 / duration).clamp(0.0, 1.0));
                 }
             }
         }
     }
     let status = child.wait().map_err(|e| e.to_string())?;
     if !status.success() {
-        let _ = std::fs::remove_file(&out);
         return Err(format!("L'export a échoué.\n{}", ffmpeg::log_tail(log, 4)));
+    }
+    Ok(())
+}
+
+/// Lance l'export et rapporte la progression (0..1).
+pub fn run(ffmpeg_path: &Path, p: &Project, log: &Path, progress: &dyn Fn(f64)) -> Result<PathBuf, String> {
+    let plan = plan(p, &|f| ffmpeg::probe(ffmpeg_path, Path::new(f)))?;
+    let out = PathBuf::from(&p.output);
+    if let Some(d) = out.parent() {
+        std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+    }
+    let tail = |extra: &[&str]| -> Vec<String> {
+        let mut v = plan.args.clone();
+        v.extend(plan.video.iter().cloned());
+        v.extend(extra.iter().map(|x| x.to_string()));
+        v
+    };
+    let total = format!("{:.3}", plan.duration);
+    let result = if plan.two_pass {
+        // Deux passes : la taille du fichier respecte la cible.
+        let stats = log.with_extension("passe").to_string_lossy().into_owned();
+        let first = tail(&["-pass", "1", "-passlogfile", &stats, "-map", "[ac]", "-c:a", "pcm_s16le", "-t", &total, "-f", "null", "-"]);
+        let r = run_pass(ffmpeg_path, &first, log, plan.duration, &|x| progress(x * 0.45)).and_then(|_| {
+            let mut second = tail(&["-pass", "2", "-passlogfile", &stats, "-map", "[ac]"]);
+            second.extend(plan.audio.iter().cloned());
+            second.extend(["-movflags".into(), "+faststart".into(), "-t".into(), total.clone(), p.output.clone()]);
+            run_pass(ffmpeg_path, &second, log, plan.duration, &|x| progress(0.45 + x * 0.55))
+        });
+        for suffix in ["-0.log", "-0.log.mbtree", "-0.log.temp", "-0.log.mbtree.temp"] {
+            let _ = std::fs::remove_file(format!("{stats}{suffix}"));
+        }
+        r
+    } else {
+        let mut one = tail(&["-map", "[ac]"]);
+        one.extend(plan.audio.iter().cloned());
+        one.extend(["-movflags".into(), "+faststart".into(), "-t".into(), total.clone(), p.output.clone()]);
+        run_pass(ffmpeg_path, &one, log, plan.duration, progress)
+    };
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&out);
+        return Err(e);
     }
     progress(1.0);
     Ok(out)
@@ -224,7 +294,11 @@ mod tests {
     use super::*;
 
     fn info(audio: u32) -> MediaInfo {
-        MediaInfo { duration: 30.0, width: 1921, height: 1080, fps: 60.0, audio_streams: audio, has_video: true }
+        MediaInfo { duration: 30.0, width: 1921, height: 1080, fps: 60.0, audio_streams: audio, has_video: true, audio_titles: vec![] }
+    }
+
+    fn plan_for(p: &Project) -> Plan {
+        plan(p, &|f| Ok(info(if f == "b.mp4" { 0 } else { 4 }))).unwrap()
     }
 
     #[test]
@@ -241,6 +315,7 @@ mod tests {
             ],
             overlays: vec![Overlay { png: "o.png".into(), start: 1.0, end: 3.0 }],
             output: "out.mp4".into(),
+            target_mb: None,
         };
         let plan = plan(&p, &|f| Ok(info(if f == "b.mp4" { 0 } else { 4 }))).unwrap();
         assert!((plan.duration - 8.0).abs() < 1e-9);
@@ -251,12 +326,14 @@ mod tests {
         assert!(fc.contains("scale=1920:1080"), "dimensions paires");
         assert!(fc.contains("anullsrc"), "vidéo insérée sans son = silence");
         assert!(fc.contains("[vc][2:v:0]overlay=0:0:enable='between(t,1.000,3.000)'"));
-        assert_eq!(plan.args.last().unwrap(), "out.mp4");
+        assert!(!plan.two_pass);
+        let small = plan_for(&Project { target_mb: Some(10), ..p.clone() });
+        assert!(small.two_pass && small.video.contains(&"9272k".to_string()), "{:?}", small.video);
     }
 
     #[test]
     fn empty_project_is_rejected() {
-        let p = Project { main: "a".into(), track_count: 0, mix_first: false, volumes: vec![], pieces: vec![], overlays: vec![], output: "o".into() };
+        let p = Project { main: "a".into(), track_count: 0, mix_first: false, volumes: vec![], pieces: vec![], overlays: vec![], output: "o".into(), target_mb: None };
         assert!(plan(&p, &|_| Ok(info(1))).is_err());
     }
 }

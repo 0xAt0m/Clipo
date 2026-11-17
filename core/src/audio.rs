@@ -156,6 +156,9 @@ pub struct Shared {
     pub stop: AtomicBool,
     /// PID racine de l'application vocale (0 = absente).
     pub voice_pid: AtomicU32,
+    /// PID du jeu isolé (0 = aucun jeu détecté : la piste Jeu prend alors tout sauf le vocal).
+    pub game_pid: AtomicU32,
+    pub game_name: Mutex<String>,
     pub mic: String,
 }
 
@@ -175,6 +178,8 @@ impl AudioEngine {
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             voice_pid: AtomicU32::new(0),
+            game_pid: AtomicU32::new(0),
+            game_name: Mutex::new(String::new()),
             mic: cfg.mic.clone(),
         });
         let mut kinds = Vec::new();
@@ -195,8 +200,8 @@ impl AudioEngine {
         // Surveille la présence de l'application vocale.
         {
             let shared = shared.clone();
-            let name = cfg.voice_app.clone();
-            threads.push(std::thread::spawn(move || watch_voice(shared, name)));
+            let (voice, game) = (cfg.voice_app.clone(), cfg.game_app.clone());
+            threads.push(std::thread::spawn(move || watch_apps(shared, voice, game)));
         }
 
         for (i, kind) in kinds.into_iter().enumerate() {
@@ -216,6 +221,14 @@ impl AudioEngine {
 
     pub fn voice_detected(&self) -> bool {
         self.shared.voice_pid.load(Ordering::Relaxed) != 0
+    }
+
+    /// Nom du jeu actuellement isolé sur la piste Jeu.
+    pub fn game(&self) -> Option<String> {
+        if self.shared.game_pid.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some(self.shared.game_name.lock().unwrap().clone())
     }
 
     /// Accès en lecture, utilisable sans verrouiller le moteur.
@@ -292,37 +305,73 @@ pub fn nap(shared: &Shared, total: Duration) {
     }
 }
 
-fn watch_voice(shared: Arc<Shared>, exe: String) {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+/// Applications qui passent en plein écran sans être des jeux.
+const NOT_GAMES: &[&str] = &[
+    "explorer", "clipo", "dwm", "chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "vlc",
+    "spotify", "applicationframehost", "searchhost", "lockapp", "textinputhost", "shellexperiencehost",
+    "startmenuexperiencehost", "steamwebhelper", "obs64", "mpc-hc64", "wmplayer", "code", "devenv",
+];
+
+fn stem_of(name: &str) -> String {
+    let n = name.to_lowercase();
+    n.trim_end_matches(".exe").to_string()
+}
+
+/// Suit l'application vocale et le jeu (processus au premier plan en plein écran).
+fn watch_apps(shared: Arc<Shared>, voice_exe: String, game_exe: String) {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let Ok(mut sys) = System::new() else { return };
-    let want = exe.to_lowercase();
-    let stem = want.trim_end_matches(".exe").to_string();
+    let voice = stem_of(&voice_exe);
+    let game = stem_of(&game_exe);
+    let auto = game.is_empty() || game == "auto";
     while !shared.stop.load(Ordering::Relaxed) {
-        let mut pid = 0u32;
-        if !want.is_empty() {
-            sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
-            let is_match = |p: &sysinfo::Process| {
-                let n = p.name().to_string_lossy().to_lowercase();
-                n == want || n.trim_end_matches(".exe") == stem
-            };
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+        // Racine d'une application : son parent n'est pas la même application.
+        let root_of = |want: &str| -> u32 {
+            if want.is_empty() {
+                return 0;
+            }
             for p in sys.processes().values() {
-                if !is_match(p) {
+                if stem_of(&p.name().to_string_lossy()) != want {
                     continue;
                 }
-                // La racine de l'arbre : son parent n'est pas la même application.
                 let parent_same = p
                     .parent()
                     .and_then(|pp| sys.process(pp))
-                    .map(|pp| is_match(pp))
+                    .map(|pp| stem_of(&pp.name().to_string_lossy()) == want)
                     .unwrap_or(false);
                 if !parent_same {
-                    pid = p.pid().as_u32();
-                    break;
+                    return p.pid().as_u32();
                 }
             }
+            0
+        };
+        shared.voice_pid.store(root_of(&voice), Ordering::Relaxed);
+
+        let mut pid = shared.game_pid.load(Ordering::Relaxed);
+        if auto {
+            // Le jeu reste « le jeu » tant qu'il tourne, même si l'on passe sur une autre fenêtre.
+            if pid != 0 && sys.process(Pid::from_u32(pid)).is_none() {
+                pid = 0;
+            }
+            if let Some(front) = crate::capture::fullscreen_foreground_pid() {
+                if let Some(p) = sys.process(Pid::from_u32(front)) {
+                    let name = stem_of(&p.name().to_string_lossy());
+                    if front != std::process::id() && name != voice && !NOT_GAMES.contains(&name.as_str()) {
+                        pid = front;
+                    }
+                }
+            }
+        } else {
+            pid = root_of(&game);
         }
-        shared.voice_pid.store(pid, Ordering::Relaxed);
-        nap(&shared, Duration::from_secs(3));
+        if pid != 0 {
+            if let Some(p) = sys.process(Pid::from_u32(pid)) {
+                *shared.game_name.lock().unwrap() = p.name().to_string_lossy().into_owned();
+            }
+        }
+        shared.game_pid.store(pid, Ordering::Relaxed);
+        nap(&shared, Duration::from_secs(2));
     }
 }
 

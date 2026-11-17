@@ -18,6 +18,9 @@ pub struct ClipMeta {
     /// Vrai si la première piste audio du mp4 est le mixage (les pistes séparées suivent).
     pub mix_first: bool,
     pub duration: f64,
+    /// Nombre de pistes audio du fichier (0 = inconnu).
+    #[serde(default)]
+    pub audio_streams: u32,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -37,6 +40,8 @@ pub struct ClipInfo {
     pub size: u64,
     pub tracks: Vec<TrackInfo>,
     pub mix_first: bool,
+    /// Dossier d'origine quand le clip ne vient pas du dossier principal.
+    pub source: Option<String>,
 }
 
 /// Dossier annexe d'un clip (pistes séparées, vignette, projet de montage).
@@ -147,12 +152,13 @@ impl ClipJob {
         cmd.args(["-map", "0:v:0"]);
         let mut a = 0;
         if mix_first {
-            cmd.args(["-map", "[mix]", "-metadata:s:a:0", "title=Mixage"]);
+            cmd.args(["-map", "[mix]", "-metadata:s:a:0", "title=Mixage", "-metadata:s:a:0", "handler_name=Mixage"]);
             a = 1;
         }
         for (i, name) in names.iter().enumerate() {
             cmd.args(["-map", &format!("{}:a", i + 1)]);
             cmd.arg(format!("-metadata:s:a:{}", a + i)).arg(format!("title={name}"));
+            cmd.arg(format!("-metadata:s:a:{}", a + i)).arg(format!("handler_name={name}"));
         }
         cmd.args(["-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"]);
         cmd.arg(&out);
@@ -176,7 +182,8 @@ impl ClipJob {
             let _ = std::fs::remove_dir_all(&side);
             return Err(format!("Échec de l'assemblage du clip.\n{}", ffmpeg::log_tail(&log, 4)));
         }
-        let meta = ClipMeta { tracks: names, mix_first, duration };
+        let audio_streams = (n + usize::from(mix_first)) as u32;
+        let meta = ClipMeta { tracks: names, mix_first, duration, audio_streams };
         let _ = std::fs::write(side.join("meta.json"), serde_json::to_string(&meta).unwrap_or_default());
         clip_info(&out).ok_or_else(|| "Clip introuvable après écriture.".to_string())
     }
@@ -212,31 +219,55 @@ pub fn clip_info(path: &Path) -> Option<ClipInfo> {
         size: md.len(),
         tracks,
         mix_first: meta.mix_first,
+        source: None,
     })
 }
 
-/// Clips du dossier, du plus récent au plus ancien.
-pub fn list_clips(ffmpeg: &Path, dir: &Path) -> Vec<ClipInfo> {
-    let mut v: Vec<ClipInfo> = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return v };
+fn is_video(p: &Path) -> bool {
+    p.extension()
+        .map(|x| matches!(x.to_string_lossy().to_lowercase().as_str(), "mp4" | "mkv" | "mov" | "webm"))
+        .unwrap_or(false)
+}
+
+fn scan(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
-        let is_video = p
-            .extension()
-            .map(|x| matches!(x.to_string_lossy().to_lowercase().as_str(), "mp4" | "mkv" | "mov" | "webm"))
-            .unwrap_or(false);
-        if !is_video {
-            continue;
+        if p.is_dir() {
+            let hidden = p.file_name().map(|n| n.to_string_lossy().starts_with('.')).unwrap_or(true);
+            if depth > 0 && !hidden {
+                scan(&p, depth - 1, out);
+            }
+        } else if is_video(&p) {
+            out.push(p);
         }
-        if let Some(mut info) = clip_info(&p) {
+    }
+}
+
+/// Clips du dossier principal et des dossiers supplémentaires (sous-dossiers
+/// compris, par exemple un dossier par jeu), du plus récent au plus ancien.
+pub fn list_clips(ffmpeg: &Path, dir: &Path, extra: &[String]) -> Vec<ClipInfo> {
+    let mut v: Vec<ClipInfo> = Vec::new();
+    let mut files = Vec::new();
+    scan(dir, 0, &mut files);
+    let main_count = files.len();
+    for d in extra {
+        scan(Path::new(d), 3, &mut files);
+    }
+    for (i, p) in files.iter().enumerate() {
+        if let Some(mut info) = clip_info(p) {
             // Fichier venu d'ailleurs (ou export) : on crée durée et vignette une fois.
             if info.duration == 0.0 || info.thumb.is_none() {
-                ensure_sidecar(ffmpeg, &p, &mut info);
+                ensure_sidecar(ffmpeg, p, &mut info);
+            }
+            if i >= main_count {
+                info.source = p.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned());
             }
             v.push(info);
         }
     }
     v.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+    v.dedup_by(|a, b| a.path == b.path);
     v
 }
 
@@ -248,7 +279,7 @@ fn ensure_sidecar(ffmpeg: &Path, clip: &Path, info: &mut ClipInfo) {
     if info.duration == 0.0 {
         if let Ok(m) = ffmpeg::probe(ffmpeg, clip) {
             info.duration = m.duration;
-            let meta = ClipMeta { tracks: vec![], mix_first: false, duration: m.duration };
+            let meta = ClipMeta { tracks: vec![], mix_first: false, duration: m.duration, audio_streams: m.audio_streams };
             let _ = std::fs::write(side.join("meta.json"), serde_json::to_string(&meta).unwrap_or_default());
         }
     }
@@ -269,6 +300,50 @@ fn ensure_sidecar(ffmpeg: &Path, clip: &Path, info: &mut ClipInfo) {
             info.thumb = Some(thumb.to_string_lossy().into_owned());
         }
     }
+}
+
+/// Prépare un clip pour l'éditeur. Pour un fichier à plusieurs pistes audio
+/// enregistré par un autre logiciel (SteelSeries GG, OBS…), chaque piste est
+/// extraite une fois afin d'être réglable séparément.
+pub fn prepare_clip(ffmpeg: &Path, clip: &Path) -> Result<ClipInfo, String> {
+    let mut info = clip_info(clip).ok_or("Clip introuvable.")?;
+    ensure_sidecar(ffmpeg, clip, &mut info);
+    if !info.tracks.is_empty() {
+        return Ok(info);
+    }
+    let m = ffmpeg::probe(ffmpeg, clip)?;
+    if m.audio_streams < 2 {
+        return Ok(info);
+    }
+    // Une première piste intitulée « mix » contient déjà les autres : on ne la rejoue pas.
+    let title = |i: usize| m.audio_titles.get(i).cloned().unwrap_or_default();
+    let first = title(0).to_lowercase();
+    let mix_first = ["mix", "combin", "master", "all audio"].iter().any(|k| first.contains(k));
+    let skip = usize::from(mix_first);
+    let side = sidecar_dir(clip);
+    let mut cmd = ffmpeg::command(ffmpeg);
+    cmd.args(["-loglevel", "error", "-y", "-i"]).arg(clip);
+    let mut names = Vec::new();
+    for (j, i) in (skip..m.audio_streams as usize).enumerate() {
+        cmd.args(["-map", &format!("0:a:{i}"), "-vn", "-c:a", "aac", "-b:a", "160k"]);
+        cmd.arg(side.join(format!("track{j}.m4a")));
+        let t = title(i);
+        names.push(if t.is_empty() { format!("Piste {}", i + 1) } else { t });
+    }
+    let ok = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return Err("Impossible de séparer les pistes audio de ce fichier.".into());
+    }
+    let meta = ClipMeta { tracks: names, mix_first, duration: m.duration, audio_streams: m.audio_streams };
+    std::fs::write(side.join("meta.json"), serde_json::to_string(&meta).unwrap_or_default())
+        .map_err(|e| e.to_string())?;
+    clip_info(clip).ok_or_else(|| "Clip introuvable.".to_string())
 }
 
 pub fn delete_clip(path: &Path) -> Result<(), String> {

@@ -37,6 +37,11 @@ jobs:
       - name: Tests du moteur
         run: cargo test -p clipo-core
 
+      # Informatif : la machine de build n'a ni carte graphique ni vrai écran.
+      - name: Diagnostic de la capture
+        continue-on-error: true
+        run: cargo run -q -p clipo-core --bin diagnose -- app/resources/ffmpeg.exe
+
       - name: Installer la CLI Tauri
         run: cargo install tauri-cli --version "^2" --locked
 

@@ -1,7 +1,8 @@
 //! Capture audio. Sous Windows : WASAPI, avec capture par application
 //! (Windows 10 version 2004 ou plus récent), sans pilote virtuel.
 //!  - Vocal : uniquement l'arbre de processus de l'application vocale ;
-//!  - Jeu   : tout le son du système SAUF l'application vocale ;
+//!  - Jeu   : uniquement l'arbre de processus du jeu détecté ; si aucun jeu
+//!            n'est détecté, tout le son du système SAUF l'application vocale ;
 //!  - Micro : périphérique d'entrée.
 
 #[cfg(windows)]
@@ -21,7 +22,8 @@ pub fn capture_loop(track: Arc<Track>, shared: Arc<Shared>) {
             nap(&shared, Duration::from_secs(1));
             continue;
         }
-        if let Err(e) = win::run(&track, &shared, voice) {
+        let game = shared.game_pid.load(Ordering::Relaxed);
+        if let Err(e) = win::run(&track, &shared, voice, game) {
             eprintln!("[clipo] capture {} : {e}", track.kind.label());
         }
         track.active.store(false, Ordering::Relaxed);
@@ -41,7 +43,7 @@ mod win {
     }
 
     /// Capture jusqu'à l'arrêt, une erreur, ou un changement de l'application vocale.
-    pub fn run(track: &Track, shared: &Shared, voice: u32) -> Result<(), String> {
+    pub fn run(track: &Track, shared: &Shared, voice: u32, game: u32) -> Result<(), String> {
         let format = WaveFormat::new(16, 16, SampleType::Int, 48_000, 2, None);
         let mut client = match track.kind {
             Kind::Mic => {
@@ -57,6 +59,10 @@ mod win {
                 dev.get_iaudioclient().map_err(err)?
             }
             Kind::Voice => AudioClient::new_application_loopback_client(voice, true).map_err(err)?,
+            Kind::Game if game != 0 => {
+                // Jeu détecté : on n'enregistre que lui (la musique à côté reste hors du clip).
+                AudioClient::new_application_loopback_client(game, true).map_err(err)?
+            }
             Kind::Game => {
                 // Mode « exclusion » : tout sauf l'arbre du processus cible. Sans
                 // application vocale, on exclut Clipo lui-même (qui est muet).
@@ -78,7 +84,15 @@ mod win {
             if shared.stop.load(Ordering::Relaxed) {
                 break Ok(());
             }
-            if track.kind != Kind::Mic && shared.voice_pid.load(Ordering::Relaxed) != voice {
+            let voice_now = shared.voice_pid.load(Ordering::Relaxed);
+            let game_now = shared.game_pid.load(Ordering::Relaxed);
+            let changed = match track.kind {
+                Kind::Mic => false,
+                Kind::Voice => voice_now != voice,
+                // Sans jeu détecté, la piste dépend de l'application vocale à exclure.
+                Kind::Game => game_now != game || (game == 0 && voice_now != voice),
+            };
+            if changed {
                 break Ok(());
             }
             let mut failed = None;
@@ -172,4 +186,62 @@ pub fn capture_loop(track: Arc<Track>, shared: Arc<Shared>) {
 #[cfg(not(windows))]
 pub fn list_mics() -> Vec<String> {
     Vec::new()
+}
+
+/// PID de l'application au premier plan si sa fenêtre couvre tout l'écran.
+#[cfg(windows)]
+pub fn fullscreen_foreground_pid() -> Option<u32> {
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct MonitorInfo {
+        cb_size: u32,
+        rc_monitor: Rect,
+        rc_work: Rect,
+        flags: u32,
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetForegroundWindow() -> isize;
+        fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
+        fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+        fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+    }
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd == 0 {
+            return None;
+        }
+        let mut rect = Rect::default();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return None;
+        }
+        // MONITOR_DEFAULTTONEAREST
+        let monitor = MonitorFromWindow(hwnd, 2);
+        let mut info = MonitorInfo { cb_size: std::mem::size_of::<MonitorInfo>() as u32, ..Default::default() };
+        if monitor == 0 || GetMonitorInfoW(monitor, &mut info) == 0 {
+            return None;
+        }
+        let m = info.rc_monitor;
+        let covers = rect.left <= m.left && rect.top <= m.top && rect.right >= m.right && rect.bottom >= m.bottom;
+        if !covers {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        (pid != 0).then_some(pid)
+    }
+}
+
+#[cfg(not(windows))]
+pub fn fullscreen_foreground_pid() -> Option<u32> {
+    None
 }

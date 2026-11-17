@@ -68,10 +68,11 @@
   </div>
   <div id="timeline" class="timeline">
     <div id="tl-pieces" class="lane pieces"></div>
+    <div id="tl-waves"></div>
     <div id="tl-overlays" class="lane ovs"></div>
     <div id="playhead"></div>
   </div>
-  <p class="hint">Pour retirer un passage : <b>Couper</b> au début, <b>Couper</b> à la fin, cliquer le morceau, puis <b>Supprimer</b>.</p>
+  <p class="hint">Glissez un bord d'un morceau pour ajuster sa durée. Pour retirer un passage : <b>Couper</b> avant, <b>Couper</b> après, cliquer le morceau, <b>Supprimer</b>.</p>
 </main>
 
 <!-- Réglages -->
@@ -89,13 +90,20 @@
         </select></label>
       <label class="row"><span>Raccourci</span><button id="s-hotkey" class="btn key"></button></label>
       <label class="row"><span>Dossier</span><button id="s-dir" class="btn path"></button></label>
+      <label class="row"><span>Son de confirmation</span><input type="checkbox" id="s-sound-on"></label>
+      <div class="row sub"><span>Fichier .wav</span><span class="group"><button id="s-sound-reset" class="btn ghost" hidden>Défaut</button><button id="s-sound" class="btn path"></button><button id="s-sound-test" class="btn">Écouter</button></span></div>
 
       <h3>Son</h3>
-      <label class="row"><span>Piste « Jeu » <small>tout le son du PC sauf le vocal</small></span><input type="checkbox" id="s-game"></label>
+      <label class="row"><span>Piste « Jeu » <small>uniquement le jeu : la musique à côté n'est pas enregistrée</small></span><input type="checkbox" id="s-game"></label>
+      <label class="row sub"><span>Jeu <small>vide = détecté en plein écran</small></span><input type="text" id="s-gameapp" spellcheck="false" placeholder="Automatique"></label>
       <label class="row"><span>Piste « Vocal »</span><input type="checkbox" id="s-voice"></label>
       <label class="row sub"><span>Application</span><input type="text" id="s-voiceapp" spellcheck="false"></label>
       <label class="row"><span>Piste « Micro »</span><input type="checkbox" id="s-mic-on"></label>
       <label class="row sub"><span>Périphérique</span><select id="s-mic"></select></label>
+
+      <h3>Bibliothèque</h3>
+      <div class="row"><span>Autres dossiers <small>clips SteelSeries GG, OBS… pistes audio reconnues</small></span><button id="s-dir-add" class="btn">Ajouter</button></div>
+      <div id="s-dirs"></div>
 
       <h3>Vidéo</h3>
       <label class="row"><span>Résolution</span>
@@ -111,6 +119,31 @@
       <label class="row"><span>Lancer avec Windows <small>réduit dans la zone de notification</small></span><input type="checkbox" id="s-autostart"></label>
       <label class="row"><span>Décalage du son <small id="s-offset-val"></small></span><input type="range" id="s-offset" min="-300" max="300" step="10"></label>
       <p class="note" id="s-encoder"></p>
+    </div>
+  </div>
+</div>
+
+<!-- Choix de la compression -->
+<div id="export-sheet" class="modal" hidden>
+  <div class="sheet small">
+    <h2>Exporter</h2>
+    <div class="presets">
+      <button class="preset" data-preset="original"><b>Original</b><small>Qualité maximale</small></button>
+      <button class="preset" data-preset="100"><b>100 Mo</b><small>Très bonne qualité</small></button>
+      <button class="preset" data-preset="50"><b>50 Mo</b><small>Bonne qualité</small></button>
+      <button class="preset" data-preset="10"><b>10 Mo</b><small>Partage Discord</small></button>
+    </div>
+    <div class="actions-row"><button class="btn" data-close>Annuler</button><button id="export-go" class="btn primary">Exporter</button></div>
+  </div>
+</div>
+
+<!-- Diagnostic -->
+<div id="diag" class="modal" hidden>
+  <div class="sheet">
+    <div class="sheet-head"><h2>Diagnostic de la capture</h2><button class="btn icon" data-close aria-label="Fermer">✕</button></div>
+    <div class="sheet-body">
+      <pre id="diag-text"></pre>
+      <div class="actions-row"><button id="diag-copy" class="btn primary">Copier le journal</button></div>
     </div>
   </div>
 </div>

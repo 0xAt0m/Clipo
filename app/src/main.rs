@@ -38,20 +38,41 @@ fn show_main(app: &AppHandle) {
         .build();
 }
 
+/// Joue un fichier .wav (bloquant : à appeler hors du fil principal).
 #[cfg(windows)]
-fn beep(ok: bool) {
-    #[link(name = "user32")]
+fn play_wav(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "winmm")]
     extern "system" {
-        fn MessageBeep(kind: u32) -> i32;
+        fn PlaySoundW(sound: *const u16, module: isize, flags: u32) -> i32;
     }
-    // MB_ICONASTERISK / MB_ICONHAND
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SND_FILENAME | SND_NODEFAULT (lecture synchrone)
     unsafe {
-        MessageBeep(if ok { 0x40 } else { 0x10 });
+        PlaySoundW(wide.as_ptr(), 0, 0x0002_0000 | 0x0002);
     }
 }
 
 #[cfg(not(windows))]
-fn beep(_ok: bool) {}
+fn play_wav(_path: &Path) {}
+
+/// Signal de confirmation : fichier choisi par l'utilisateur, sinon son intégré.
+fn beep(app: &AppHandle, ok: bool) {
+    let cfg = app.state::<AppState>().engine.lock().unwrap().cfg.clone();
+    if !cfg.sound_enabled {
+        return;
+    }
+    let (built_ok, built_err) = clipo_core::sound::install(&clipo_core::config::data_dir().join("sons"));
+    let custom = PathBuf::from(&cfg.sound_file);
+    let file = if !ok {
+        built_err
+    } else if !cfg.sound_file.is_empty() && custom.exists() {
+        custom
+    } else {
+        built_ok
+    };
+    play_wav(&file);
+}
 
 /// Sauve le contenu du buffer dans un clip, sans bloquer l'interface.
 fn save_clip(app: &AppHandle) {
@@ -67,11 +88,11 @@ fn save_clip(app: &AppHandle) {
         state.saving.store(false, Ordering::SeqCst);
         match result {
             Ok(info) => {
-                beep(true);
+                beep(&app, true);
                 let _ = app.emit("clip-saved", &info);
             }
             Err(e) => {
-                beep(false);
+                beep(&app, false);
                 let _ = app.emit("clip-error", e);
             }
         }
@@ -144,11 +165,35 @@ fn save_clip_now(app: AppHandle) {
 
 #[tauri::command(async)]
 fn list_clips(state: State<AppState>) -> Vec<ClipInfo> {
-    let (ffmpeg, dir) = {
+    let (ffmpeg, dir, extra) = {
         let e = state.engine.lock().unwrap();
-        (e.ffmpeg.clone(), PathBuf::from(&e.cfg.clips_dir))
+        (e.ffmpeg.clone(), PathBuf::from(&e.cfg.clips_dir), e.cfg.extra_dirs.clone())
     };
-    clip::list_clips(&ffmpeg, &dir)
+    clip::list_clips(&ffmpeg, &dir, &extra)
+}
+
+/// Prépare un clip pour l'éditeur (sépare les pistes d'un fichier venu d'un autre logiciel).
+#[tauri::command(async)]
+fn prepare_clip(state: State<AppState>, path: String) -> Result<ClipInfo, String> {
+    let ffmpeg = state.engine.lock().unwrap().ffmpeg.clone();
+    clip::prepare_clip(&ffmpeg, Path::new(&path))
+}
+
+/// Forme d'onde d'une piste audio (50 points par seconde, 0-255).
+#[tauri::command(async)]
+fn waveform(state: State<AppState>, path: String, stream: u32) -> Result<Vec<u8>, String> {
+    let ffmpeg = state.engine.lock().unwrap().ffmpeg.clone();
+    ffmpeg::waveform(&ffmpeg, Path::new(&path), stream, 50)
+}
+
+#[tauri::command(async)]
+fn get_diagnostics(state: State<AppState>) -> String {
+    state.engine.lock().unwrap().diagnostics()
+}
+
+#[tauri::command(async)]
+fn test_sound(app: AppHandle) {
+    beep(&app, true);
 }
 
 #[tauri::command(async)]
@@ -325,7 +370,11 @@ fn main() {
             read_data_url,
             write_overlay,
             export_project,
-            list_mics
+            list_mics,
+            prepare_clip,
+            waveform,
+            get_diagnostics,
+            test_sound
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -359,6 +408,12 @@ fn main() {
                     let _ = h.emit("status-changed", ());
                 });
             }
+            // Surveillance : bascule sur la capture de secours si la capture légère échoue.
+            let h = handle.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                h.state::<AppState>().engine.lock().unwrap().maintain();
+            });
             if !std::env::args().any(|a| a == "--minimized") {
                 show_main(&handle);
             }

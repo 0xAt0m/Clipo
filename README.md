@@ -3,8 +3,10 @@
 Clips de jeu et montage de base pour Windows 10/11, en version minimaliste.
 
 - **Un raccourci** (Alt + F10 par défaut) enregistre les X dernières secondes ou minutes.
-- **Pistes son séparées** : Jeu, Vocal (Discord), Micro — sans pilote ni câble virtuel.
-- **Montage simple** : volume par piste, coupes (y compris au milieu), texte, image, vidéo insérée.
+- **Pistes son séparées** : Jeu (le jeu seul, sans la musique à côté), Vocal (Discord), Micro — sans pilote ni câble virtuel.
+- **Montage simple** : volume par piste avec formes d'onde, durée ajustable en glissant les bords, coupes (y compris au milieu), texte, image, vidéo insérée.
+- **Export compressé** : Original, 100 Mo, 50 Mo ou 10 Mo (le dernier choix est mémorisé).
+- **Clips d'autres logiciels** : ajoutez leur dossier (SteelSeries GG, OBS…) dans Réglages → Bibliothèque ; les pistes audio séparées sont reconnues.
 - **Léger** : en fond, seuls un petit processus et l'encodeur matériel du GPU tournent. La fenêtre (et son moteur web) est détruite dès qu'on la ferme.
 
 ## Installer
@@ -25,7 +27,8 @@ Pour publier une version : `git tag v0.1.0 && git push --tags`.
 | Monter | Cliquer un clip. **Couper** (S) à la tête de lecture, cliquer un morceau, **Supprimer** (Suppr). Ctrl+Z annule. |
 | Régler le son | Curseur et bouton muet par piste, à droite de l'aperçu. |
 | Ajouter | **+ Texte**, **+ Image** (calques à déplacer à la souris), **+ Vidéo** (insérée à la tête de lecture). |
-| Exporter | Crée `<nom>_montage_<heure>.mp4` à côté du clip. |
+| Ajuster la durée | Maintenir le clic gauche sur un bord d'un morceau et glisser. |
+| Exporter | Choisir le niveau de compression ; le fichier est créé dans le dossier des clips. |
 
 Les clips sont des `.mp4` standards : première piste audio = mixage (lisible partout),
 pistes suivantes = Jeu / Vocal / Micro. Le dossier `.clipo` à côté des clips contient les
@@ -34,8 +37,25 @@ vignettes, les pistes pour l'aperçu et les projets de montage.
 ### Discord
 
 Rien à configurer dans Discord. Windows fournit directement à Clipo le son de l'application
-indiquée dans Réglages → Son → Application (`Discord.exe`). La piste « Jeu » reçoit tout le
-reste du son du PC.
+indiquée dans Réglages → Son → Application (`Discord.exe`).
+
+### Piste « Jeu »
+
+Clipo isole le son de l'application au premier plan en plein écran (ou fenêtré sans bordure) et
+la garde comme « jeu » tant qu'elle tourne. La musique ou le navigateur à côté ne sont pas
+enregistrés. Si la détection se trompe, indiquez le nom de l'exécutable dans Réglages → Son → Jeu.
+Tant qu'aucun jeu n'est détecté, la piste reçoit tout le son du PC sauf le vocal.
+
+### Son de confirmation
+
+Deux notes brèves, la seconde un ton plus haut. Réglages → Clip permet de le couper ou de le
+remplacer par n'importe quel fichier `.wav`.
+
+### En cas de problème de capture
+
+Si la pastille devient orange, cliquez dessus : le diagnostic affiche le journal, à copier.
+Clipo bascule de lui-même sur une méthode de capture de secours (plus lourde) si la méthode
+légère échoue.
 
 ## Fonctionnement
 

@@ -38,13 +38,32 @@ fn main() {
         ],
         overlays: std::env::args().nth(2).map(|png| vec![export::Overlay { png, start: 1.0, end: 4.0 }]).unwrap_or_default(),
         output: out.join("export.mp4").to_string_lossy().into_owned(),
+        target_mb: None,
     };
     let r = export::run(&ff, &project, &out.join("export.log"), &|p| print!("\r{:.0}%", p * 100.0)).expect("export");
     let m = ffmpeg::probe(&ff, &r).unwrap();
     println!("\nprobe export: {m:?}");
     assert!((m.duration - 7.5).abs() < 0.2);
-    let list = clip::list_clips(&ff, &out);
-    println!("bibliothèque: {:?}", list.iter().map(|c| (&c.name, c.duration, c.thumb.is_some())).collect::<Vec<_>>());
+    // Export compressé : 1 Mo maximum.
+    let small = export::Project { target_mb: Some(1), output: out.join("petit.mp4").to_string_lossy().into_owned(), ..project.clone() };
+    let r = export::run(&ff, &small, &out.join("export.log"), &|_| {}).expect("export 1 Mo");
+    let bytes = std::fs::metadata(&r).unwrap().len();
+    let m = ffmpeg::probe(&ff, &r).unwrap();
+    println!("export 1 Mo : {} octets, {m:?}", bytes);
+    assert!(bytes <= 1_000_000 && bytes > 600_000, "taille {bytes}");
+    // Fichier multi-pistes venu d'ailleurs : pistes séparées à l'ouverture.
+    let foreign = out.join("externe").join("jeu").join("steel.mp4");
+    std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    std::fs::copy(&info.path, &foreign).unwrap();
+    let f = clip::prepare_clip(&ff, &foreign).unwrap();
+    println!("externe : {:?} mix_first={}", f.tracks.iter().map(|t| &t.name).collect::<Vec<_>>(), f.mix_first);
+    assert_eq!(f.tracks.len(), 3);
+    assert!(f.mix_first);
+    let wave = ffmpeg::waveform(&ff, std::path::Path::new(&f.tracks[0].file), 0, 50).unwrap();
+    println!("forme d'onde : {} points, max {}", wave.len(), wave.iter().max().unwrap());
+    let extra = vec![out.join("externe").to_string_lossy().into_owned()];
+    let list = clip::list_clips(&ff, &out, &extra);
+    println!("bibliothèque: {:?}", list.iter().map(|c| (&c.name, c.duration, c.thumb.is_some(), &c.source)).collect::<Vec<_>>());
     let renamed = clip::rename_clip(Path::new(&info.path), "Mon clip: test?").unwrap();
     println!("renommé: {} / pistes {:?}", renamed.path, renamed.tracks.iter().map(|t| Path::new(&t.file).exists()).collect::<Vec<_>>());
     println!("OK");
