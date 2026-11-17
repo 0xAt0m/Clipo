@@ -9,7 +9,7 @@
 <body>
 <header id="top">
   <div class="brand"><img src="icon.png" alt=""><span>Clipo</span></div>
-  <button id="status" class="pill" title="Mettre le buffer en pause ou le reprendre">
+  <button id="status" class="pill" title="Activer ou désactiver le buffer">
     <i class="dot"></i><span id="status-text">Démarrage…</span>
   </button>
   <div class="spacer"></div>
@@ -58,6 +58,7 @@
     <button id="t-split" class="btn" title="Couper à la tête de lecture (S)">Couper</button>
     <button id="t-delete" class="btn" title="Supprimer la sélection (Suppr)">Supprimer</button>
     <button id="t-undo" class="btn" title="Annuler (Ctrl+Z)">Annuler</button>
+    <button id="t-redo" class="btn" title="Rétablir (Ctrl+Y)">Rétablir</button>
     <div class="spacer"></div>
     <button id="t-text" class="btn">+ Texte</button>
     <button id="t-image" class="btn">+ Image</button>
@@ -69,7 +70,7 @@
     <div class="tl-row" id="tl-ov-row" hidden><div class="gut"><span class="tname">Calques</span></div><div id="tl-overlays" class="lane ovs"></div></div>
     <div id="playhead"></div>
   </div>
-  <p class="hint">Glissez un bord d'un morceau pour ajuster sa durée. Pour retirer un passage : <b>Couper</b> avant, <b>Couper</b> après, cliquer le morceau, <b>Supprimer</b>.</p>
+  <p class="hint">Glissez un bord d'un morceau pour ajuster sa durée. Pour retirer un passage : <b>Couper</b> <kbd data-key="split">S</kbd> avant et après, cliquer le morceau, <b>Supprimer</b> <kbd data-key="delete">C</kbd>. <kbd data-key="back">Échap</kbd> revient aux clips.</p>
 </main>
 
 <!-- Réglages -->
@@ -85,10 +86,21 @@
           <option value="180">3 minutes</option><option value="300">5 minutes</option>
           <option value="600">10 minutes</option>
         </select></label>
-      <label class="row"><span>Raccourci</span><button id="s-hotkey" class="btn key"></button></label>
+      <label class="row"><span>Buffer actif <small id="s-mode-hint"></small></span>
+        <select id="s-mode">
+          <option value="game">Uniquement en jeu</option>
+          <option value="always">En permanence</option>
+          <option value="manual">Au raccourci</option>
+        </select></label>
       <label class="row"><span>Dossier</span><button id="s-dir" class="btn path"></button></label>
       <label class="row"><span>Son de confirmation</span><input type="checkbox" id="s-sound-on"></label>
       <div class="row sub"><span>Fichier .wav</span><span class="group"><button id="s-sound-reset" class="btn ghost" hidden>Défaut</button><button id="s-sound" class="btn path"></button><button id="s-sound-test" class="btn">Écouter</button></span></div>
+
+      <h3>Raccourcis</h3>
+      <label class="row"><span>Enregistrer un clip <small>fonctionne aussi en jeu</small></span><button id="s-hotkey" class="btn key"></button></label>
+      <div class="row"><span>Activer / désactiver le buffer <small>fonctionne aussi en jeu</small></span><span class="group"><button id="s-toggle-clear" class="btn ghost" title="Aucun raccourci">Retirer</button><button id="s-toggle" class="btn key"></button></span></div>
+      <div class="row"><span>Raccourcis de l'éditeur <small>cliquez une touche pour la changer</small></span><button id="s-keys-reset" class="btn ghost">Rétablir par défaut</button></div>
+      <div id="s-keys"></div>
 
       <h3>Son</h3>
       <label class="row"><span>Piste « Jeu » <small>uniquement le jeu : la musique à côté n'est pas enregistrée</small></span><input type="checkbox" id="s-game"></label>

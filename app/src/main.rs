@@ -15,12 +15,14 @@ use tauri::path::BaseDirectory;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::ManagerExt as _;
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 struct AppState {
     engine: Mutex<Engine>,
     saving: AtomicBool,
     overlay_seq: AtomicU32,
+    /// Raccourci d'activation du buffer, lisible sans verrouiller le moteur.
+    toggle_key: Mutex<String>,
 }
 
 fn show_main(app: &AppHandle) {
@@ -74,6 +76,32 @@ fn beep(app: &AppHandle, ok: bool) {
     play_wav(&file);
 }
 
+/// Note brève à l'activation ou à la désactivation du buffer.
+fn blip(app: &AppHandle, on: bool) {
+    if !app.state::<AppState>().engine.lock().unwrap().cfg.sound_enabled {
+        return;
+    }
+    let (file_on, file_off) = clipo_core::sound::install_toggle(&clipo_core::config::data_dir().join("sons"));
+    play_wav(if on { &file_on } else { &file_off });
+}
+
+/// Allume ou éteint le buffer (raccourci, menu, pastille), sans bloquer l'appelant.
+fn toggle_buffer(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let mut cfg = app.state::<AppState>().engine.lock().unwrap().cfg.clone();
+        cfg.buffer_enabled = !cfg.buffer_enabled;
+        let on = cfg.buffer_enabled;
+        match apply_config(&app, cfg) {
+            Ok(_) => blip(&app, on),
+            Err(e) => {
+                beep(&app, false);
+                let _ = app.emit("clip-error", e);
+            }
+        }
+    });
+}
+
 /// Sauve le contenu du buffer dans un clip, sans bloquer l'interface.
 fn save_clip(app: &AppHandle) {
     let state = app.state::<AppState>();
@@ -99,12 +127,27 @@ fn save_clip(app: &AppHandle) {
     });
 }
 
-fn register_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
+/// Enregistre les raccourcis globaux : clip, et activation du buffer (facultatif).
+fn register_hotkeys(app: &AppHandle, clip: &str, toggle: &str) -> Result<(), String> {
     let shortcuts = app.global_shortcut();
     let _ = shortcuts.unregister_all();
+    *app.state::<AppState>().toggle_key.lock().unwrap() = String::new();
     shortcuts
-        .register(hotkey)
-        .map_err(|e| format!("Raccourci « {hotkey} » indisponible : {e}"))
+        .register(clip)
+        .map_err(|e| format!("Raccourci « {clip} » indisponible : {e}"))?;
+    if !toggle.is_empty() {
+        shortcuts
+            .register(toggle)
+            .map_err(|e| format!("Raccourci « {toggle} » indisponible : {e}"))?;
+        *app.state::<AppState>().toggle_key.lock().unwrap() = toggle.to_string();
+    }
+    Ok(())
+}
+
+/// Le raccourci pressé est-il celui qui allume ou éteint le buffer ?
+fn is_toggle_key(app: &AppHandle, pressed: &Shortcut) -> bool {
+    let toggle = app.state::<AppState>().toggle_key.lock().unwrap().clone();
+    !toggle.is_empty() && toggle.parse::<Shortcut>().map(|s| s.id() == pressed.id()).unwrap_or(false)
 }
 
 fn apply_autostart(app: &AppHandle, on: bool) {
@@ -115,22 +158,23 @@ fn apply_autostart(app: &AppHandle, on: bool) {
 /// Applique une configuration : moteur, raccourci, démarrage automatique.
 fn apply_config(app: &AppHandle, cfg: Config) -> Result<Config, String> {
     let state = app.state::<AppState>();
-    let (cfg, old_hotkey, engine_result) = {
+    let (cfg, old, engine_result) = {
         let mut engine = state.engine.lock().unwrap();
-        let old_hotkey = engine.cfg.hotkey.clone();
+        let old = (engine.cfg.hotkey.clone(), engine.cfg.toggle_hotkey.clone());
         let result = engine.set_config(cfg);
-        (engine.cfg.clone(), old_hotkey, result)
+        (engine.cfg.clone(), old, result)
     };
     apply_autostart(app, cfg.autostart);
     let mut hotkey_result = Ok(());
-    if cfg.hotkey != old_hotkey {
-        hotkey_result = register_hotkey(app, &cfg.hotkey);
+    if (cfg.hotkey.clone(), cfg.toggle_hotkey.clone()) != old {
+        hotkey_result = register_hotkeys(app, &cfg.hotkey, &cfg.toggle_hotkey);
         if hotkey_result.is_err() {
-            // On garde l'ancien raccourci plutôt que de laisser l'app sans raccourci.
-            let _ = register_hotkey(app, &old_hotkey);
+            // On garde les anciens raccourcis plutôt que de laisser l'app sans raccourci.
+            let _ = register_hotkeys(app, &old.0, &old.1);
             let mut engine = state.engine.lock().unwrap();
             let mut fixed = engine.cfg.clone();
-            fixed.hotkey = old_hotkey;
+            fixed.hotkey = old.0;
+            fixed.toggle_hotkey = old.1;
             let _ = engine.set_config(fixed);
         }
     }
@@ -161,6 +205,11 @@ fn get_status(state: State<AppState>) -> Status {
 #[tauri::command]
 fn save_clip_now(app: AppHandle) {
     save_clip(&app);
+}
+
+#[tauri::command]
+fn toggle_buffer_now(app: AppHandle) {
+    toggle_buffer(&app);
 }
 
 #[tauri::command(async)]
@@ -318,7 +367,7 @@ fn list_mics() -> Vec<String> {
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "Ouvrir Clipo", true, None::<&str>)?;
     let clip = MenuItem::with_id(app, "clip", "Enregistrer un clip", true, None::<&str>)?;
-    let toggle = MenuItem::with_id(app, "toggle", "Mettre en pause / reprendre le buffer", true, None::<&str>)?;
+    let toggle = MenuItem::with_id(app, "toggle", "Activer / désactiver le buffer", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quitter", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(app, &[&open, &clip, &toggle, &sep, &quit])?;
@@ -329,14 +378,7 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => show_main(app),
             "clip" => save_clip(app),
-            "toggle" => {
-                let app = app.clone();
-                std::thread::spawn(move || {
-                    let mut cfg = app.state::<AppState>().engine.lock().unwrap().cfg.clone();
-                    cfg.buffer_enabled = !cfg.buffer_enabled;
-                    let _ = apply_config(&app, cfg);
-                });
-            }
+            "toggle" => toggle_buffer(app),
             "quit" => {
                 app.state::<AppState>().engine.lock().unwrap().stop_buffer();
                 app.exit(0);
@@ -371,8 +413,13 @@ fn main() {
         ))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
-                    if event.state() == ShortcutState::Pressed {
+                .with_handler(|app, shortcut, event| {
+                    if event.state() != ShortcutState::Pressed {
+                        return;
+                    }
+                    if is_toggle_key(app, shortcut) {
+                        toggle_buffer(app);
+                    } else {
                         save_clip(app);
                     }
                 })
@@ -383,6 +430,7 @@ fn main() {
             set_config,
             get_status,
             save_clip_now,
+            toggle_buffer_now,
             list_clips,
             delete_clip,
             rename_clip,
@@ -411,33 +459,30 @@ fn main() {
                 .filter(|p| p.exists());
             let ffmpeg = bundled.unwrap_or_else(|| PathBuf::from("ffmpeg"));
             let cfg = Config::load().sanitized();
-            let hotkey = cfg.hotkey.clone();
-            let start = cfg.buffer_enabled;
+            let (hotkey, toggle) = (cfg.hotkey.clone(), cfg.toggle_hotkey.clone());
             app.manage(AppState {
                 engine: Mutex::new(Engine::new(cfg, ffmpeg)),
                 saving: AtomicBool::new(false),
                 overlay_seq: AtomicU32::new(0),
+                toggle_key: Mutex::new(String::new()),
             });
             build_tray(&handle)?;
-            if let Err(e) = register_hotkey(&handle, &hotkey) {
+            if let Err(e) = register_hotkeys(&handle, &hotkey, &toggle) {
                 eprintln!("[clipo] {e}");
             }
-            if start {
-                // La détection de l'encodeur prend une à deux secondes : hors du fil principal.
-                let h = handle.clone();
-                std::thread::spawn(move || {
-                    let result = h.state::<AppState>().engine.lock().unwrap().start_buffer();
-                    if let Err(e) = result {
-                        let _ = h.emit("clip-error", e);
-                    }
-                    let _ = h.emit("status-changed", ());
-                });
-            }
-            // Surveillance : bascule sur la capture de secours si la capture légère échoue.
+            // Surveillance : démarre le buffer quand un jeu se lance (selon le mode),
+            // l'arrête après sa fermeture, et bascule sur la capture de secours si
+            // la capture légère échoue. Le premier passage est immédiat ; la détection
+            // de l'encodeur prend une à deux secondes, hors du fil principal.
             let h = handle.clone();
             std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                h.state::<AppState>().engine.lock().unwrap().maintain();
+                let state = h.state::<AppState>();
+                let busy = state.saving.load(Ordering::SeqCst);
+                let changed = state.engine.lock().unwrap().maintain(busy);
+                if changed {
+                    let _ = h.emit("status-changed", ());
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
             });
             if !std::env::args().any(|a| a == "--minimized") {
                 show_main(&handle);

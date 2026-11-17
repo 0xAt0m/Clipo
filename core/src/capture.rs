@@ -16,13 +16,13 @@ use std::time::Duration;
 pub fn capture_loop(track: Arc<Track>, shared: Arc<Shared>) {
     let _ = wasapi::initialize_mta();
     while !shared.stop.load(Ordering::Relaxed) {
-        let voice = shared.voice_pid.load(Ordering::Relaxed);
+        let voice = shared.apps.voice_pid.load(Ordering::Relaxed);
         if track.kind == Kind::Voice && voice == 0 {
             track.active.store(false, Ordering::Relaxed);
             nap(&shared, Duration::from_secs(1));
             continue;
         }
-        let game = shared.game_pid.load(Ordering::Relaxed);
+        let game = shared.apps.game_pid.load(Ordering::Relaxed);
         if let Err(e) = win::run(&track, &shared, voice, game) {
             eprintln!("[clipo] capture {} : {e}", track.kind.label());
         }
@@ -84,8 +84,8 @@ mod win {
             if shared.stop.load(Ordering::Relaxed) {
                 break Ok(());
             }
-            let voice_now = shared.voice_pid.load(Ordering::Relaxed);
-            let game_now = shared.game_pid.load(Ordering::Relaxed);
+            let voice_now = shared.apps.voice_pid.load(Ordering::Relaxed);
+            let game_now = shared.apps.game_pid.load(Ordering::Relaxed);
             let changed = match track.kind {
                 Kind::Mic => false,
                 Kind::Voice => voice_now != voice,

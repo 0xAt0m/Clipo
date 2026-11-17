@@ -198,3 +198,8 @@ input[type=number] { width: 78px; }
 .share-meta b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .share-meta span { color: var(--muted); white-space: nowrap; }
 #share-file p { text-align: center; color: var(--muted); font-size: 13px; }
+
+/* v0.4 : raccourcis et veille du buffer */
+.pill.idle .dot { background: #4f9dff; box-shadow: 0 0 0 3px rgba(79, 157, 255, .16); }
+.hint kbd { padding: 0 5px; font-size: 11px; }
+.row.sub .btn.key { min-width: 120px; height: 30px; }

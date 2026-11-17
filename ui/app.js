@@ -24,8 +24,57 @@ function fmt(t, tenths = true) {
 function fmtBuffer(sec) {
   return sec < 60 ? `${sec} dernières secondes` : sec === 60 ? 'la dernière minute' : `${sec / 60} dernières minutes`;
 }
+// Disposition du clavier (AZERTY…) : les raccourcis globaux sont des touches physiques,
+// affichées avec la lettre réellement imprimée sur le clavier.
+let layout = null;
+navigator.keyboard?.getLayoutMap?.().then(m => { layout = m; }).catch(() => {});
+const KEY_NAMES = {
+  Space: 'Espace', Escape: 'Échap', ArrowLeft: '←', ArrowRight: '→', ArrowUp: '↑', ArrowDown: '↓',
+  Delete: 'Suppr', Backspace: 'Retour arrière', Enter: 'Entrée', Shift: 'Maj', Home: 'Début', End: 'Fin',
+  PageUp: 'Page préc.', PageDown: 'Page suiv.', Insert: 'Inser', PrintScreen: 'Impr. écran',
+  ScrollLock: 'Arrêt défil.', Plus: '+',
+};
 function prettyKey(k) {
-  return k.split('+').map(p => p.replace(/^Key|^Digit/, '').replace(/^Numpad/, 'Num ')).join(' + ');
+  if (!k) return 'Aucun';
+  return k.split('+').map(p => {
+    if (/^(Key[A-Z]|Digit\d)$/.test(p)) return (layout?.get(p) || p.replace(/^Key|^Digit/, '')).toUpperCase();
+    if (/^Numpad/.test(p)) return p.replace(/^Numpad/, 'Num ');
+    return KEY_NAMES[p] || p;
+  }).join(' + ');
+}
+
+// Raccourcis de l'éditeur : identifiés par le caractère de la touche (e.key), et non par
+// sa position physique, pour que « Ctrl + Z » soit bien la touche Z sur un clavier AZERTY.
+function comboOf(e) {
+  let k = e.key;
+  if (!k || ['Control', 'Shift', 'Alt', 'Meta', 'AltGraph', 'Dead', 'Unidentified', 'OS', 'Process'].includes(k)) return null;
+  if (k === ' ' || k === 'Spacebar') k = 'Space';
+  else if (k === '+') k = 'Plus';
+  else if (k.length === 1) k = k.toUpperCase();
+  const parts = [];
+  if (e.ctrlKey) parts.push('Ctrl');
+  if (e.altKey) parts.push('Alt');
+  if (e.shiftKey) parts.push('Shift');
+  parts.push(k);
+  return parts.join('+');
+}
+
+const EDITOR_ACTIONS = [
+  ['play', 'Lecture / pause', 'Space'],
+  ['split', 'Couper à la tête de lecture', 'S'],
+  ['delete', 'Supprimer la sélection', 'C'],
+  ['undo', 'Annuler', 'Ctrl+Z'],
+  ['redo', 'Rétablir', 'Ctrl+Y'],
+  ['back', 'Retour aux clips', 'Escape'],
+  ['seekBack', 'Reculer d\'une seconde', 'ArrowLeft'],
+  ['seekFwd', 'Avancer d\'une seconde', 'ArrowRight'],
+  ['frameBack', 'Image précédente', 'Shift+ArrowLeft'],
+  ['frameFwd', 'Image suivante', 'Shift+ArrowRight'],
+];
+function editorKeys() {
+  const m = {};
+  for (const [id, , def] of EDITOR_ACTIONS) m[id] = cfg?.editor_keys?.[id] ?? def;
+  return m;
 }
 function toast(msg, opts = {}) {
   const t = el('div', 'toast' + (opts.error ? ' err' : ''));
@@ -57,12 +106,21 @@ async function refreshStatus() {
   const pill = $('#status');
   const key = prettyKey(cfg.hotkey);
   pill.className = 'pill';
-  let text;
-  if (!status.ffmpeg_ok) { pill.classList.add('warn'); text = 'ffmpeg introuvable'; }
-  else if (status.video_trouble) { pill.classList.add('warn'); text = "Capture de l'écran impossible"; }
+  let text, title = 'Cliquer pour désactiver le buffer';
+  if (!status.ffmpeg_ok) { pill.classList.add('warn'); text = 'ffmpeg introuvable'; title = 'Ouvrir le diagnostic'; }
+  else if (status.video_trouble) { pill.classList.add('warn'); text = "Capture de l'écran impossible"; title = 'Ouvrir le diagnostic'; }
   else if (status.buffering) { pill.classList.add('on'); text = `Actif · ${fmt(cfg.buffer_seconds, false)} · ${key}`; }
-  else text = cfg.buffer_enabled ? 'Démarrage…' : 'En pause';
+  else if (!cfg.buffer_enabled) {
+    text = cfg.buffer_mode === 'manual' && cfg.toggle_hotkey ? `Désactivé · ${prettyKey(cfg.toggle_hotkey)} pour l'activer` : 'Désactivé';
+    title = 'Cliquer pour activer le buffer';
+  } else if (status.waiting_game) {
+    pill.classList.add('idle');
+    text = 'En veille · aucun jeu lancé';
+    title = "Le buffer démarre tout seul au lancement d'un jeu. Cliquer pour le désactiver.";
+  } else text = 'Démarrage…';
   $('#status-text').textContent = text;
+  pill.title = title;
+  refreshKeyHints();
   $('#btn-clip').disabled = !status.buffering;
   $('#empty-key').textContent = key;
   $('#empty-len').textContent = (cfg.buffer_seconds === 60 ? '' : 'les ') + fmtBuffer(cfg.buffer_seconds);
@@ -293,10 +351,16 @@ function tick() {
   ed.raf = requestAnimationFrame(tick);
 }
 
-// Modifications : chaque action passe par ici (annulation + sauvegarde).
-function mutate(fn) {
+// Mémorise l'état avant une modification (pour Annuler) ; une nouvelle modification
+// efface ce qui pouvait être rétabli.
+function snapshot() {
   ed.undo.push(JSON.stringify(ed.project));
   if (ed.undo.length > 60) ed.undo.shift();
+  ed.redo = [];
+}
+// Modifications : chaque action passe par ici (annulation + sauvegarde).
+function mutate(fn) {
+  snapshot();
   fn();
   changed();
 }
@@ -312,14 +376,18 @@ function scheduleSave() {
   const clipPath = ed.clip.path, json = JSON.stringify(ed.project);
   ed.saveTimer = setTimeout(() => invoke('save_project', { clipPath, json }).catch(() => {}), 400);
 }
-function undo() {
-  const prev = ed.undo.pop();
+function restore(from, to) {
+  if (!ed) return;
+  const prev = from.pop();
   if (!prev) return;
+  to.push(JSON.stringify(ed.project));
   ed.project = JSON.parse(prev);
   ed.sel = null;
   changed();
   seek(Math.min(ed.T, total()));
 }
+const undo = () => ed && restore(ed.undo, ed.redo);
+const redo = () => ed && restore(ed.redo, ed.undo);
 
 function splitAt(t) {
   const loc = locate(t);
@@ -441,7 +509,7 @@ function renderTimeline() {
       drag(e, ev => {
         const dt = ((ev.clientX - x0) / w) * total();
         if (Math.abs(ev.clientX - x0) < 3 && !pushed) return;
-        if (!pushed) { ed.undo.push(JSON.stringify(ed.project)); pushed = true; }
+        if (!pushed) { snapshot(); pushed = true; }
         const cur = ed.project.overlays.find(x => x.id === o.id);
         if (!cur) return;
         if (resize) cur.end = clamp(e0 + dt, s0 + 0.2, total());
@@ -476,7 +544,7 @@ function startTrim(e, id, side) {
     const dt = (ev.clientX - x0) * secPerPx;
     if (!pushed) {
       if (Math.abs(ev.clientX - x0) < 2) return;
-      ed.undo.push(JSON.stringify(ed.project));
+      snapshot();
       pushed = true;
     }
     const p = ed.project.pieces.find(x => x.id === id);
@@ -509,7 +577,7 @@ function renderWaveRows() {
     const val = el('span', 'tval', `${Math.round((pr.volumes[i] ?? 1) * 100)} %`);
     let pushed = false;
     const apply = v => {
-      if (!pushed) { ed.undo.push(JSON.stringify(pr)); pushed = true; }
+      if (!pushed) { snapshot(); pushed = true; }
       pr.volumes[i] = v;
       range.value = v;
       val.textContent = `${Math.round(v * 100)} %`;
@@ -612,7 +680,7 @@ function renderOverlays() {
       drag(e, ev => {
         if (!pushed) {
           if (Math.abs(ev.clientX - x0) + Math.abs(ev.clientY - y0) < 3) return;
-          ed.undo.push(JSON.stringify(ed.project));
+          snapshot();
           pushed = true;
         }
         const cur = ed.project.overlays.find(x => x.id === o.id);
@@ -660,7 +728,7 @@ function renderInspector() {
   body.textContent = '';
   let pushed = false;
   const edit = fn => {
-    if (!pushed) { ed.undo.push(JSON.stringify(ed.project)); pushed = true; }
+    if (!pushed) { snapshot(); pushed = true; }
     fn();
     renderOverlays();
     renderTimeline();
@@ -725,6 +793,7 @@ $('#play').onclick = () => (ed.playing ? pause() : play());
 $('#t-split').onclick = doSplit;
 $('#t-delete').onclick = doDelete;
 $('#t-undo').onclick = undo;
+$('#t-redo').onclick = redo;
 $('#t-text').onclick = addText;
 $('#t-image').onclick = addImage;
 $('#t-video').onclick = addVideo;
@@ -765,24 +834,70 @@ $('#ed-title').onclick = () => {
   input.onblur = () => commit(true);
 };
 
+const EDITOR_RUN = {
+  play: () => (ed.playing ? pause() : play()),
+  split: doSplit,
+  delete: doDelete,
+  undo,
+  redo,
+  back: closeEditor,
+  seekBack: () => seek(ed.T - 1),
+  seekFwd: () => seek(ed.T + 1),
+  frameBack: () => seek(ed.T - 1 / 30),
+  frameFwd: () => seek(ed.T + 1 / 30),
+};
+const REPEATABLE = new Set(['undo', 'redo', 'seekBack', 'seekFwd', 'frameBack', 'frameFwd']);
+const MODALS = ['#settings', '#diag', '#export-sheet', '#share'];
+const isTextField = t => t instanceof Element &&
+  t.matches('textarea, select, input:not([type=range]):not([type=checkbox]):not([type=color]):not([type=radio])');
+
 window.addEventListener('keydown', e => {
-  if (!ed || !$('#settings').hidden || !$('#exporting').hidden || !$('#export-sheet').hidden || !$('#diag').hidden || !$('#share').hidden) return;
-  if (e.target.matches('input, textarea, select')) return;
-  if (e.code === 'Space') { e.preventDefault(); ed.playing ? pause() : play(); }
-  else if (e.code === 'KeyS' && !e.ctrlKey) doSplit();
-  else if (e.key === 'Delete' || e.key === 'Backspace') doDelete();
-  else if (e.code === 'KeyZ' && e.ctrlKey) undo();
-  else if (e.key === 'ArrowLeft') seek(ed.T - (e.shiftKey ? 1 / 30 : 1));
-  else if (e.key === 'ArrowRight') seek(ed.T + (e.shiftKey ? 1 / 30 : 1));
-  else if (e.key === 'Escape') select(null);
+  if (!$('#exporting').hidden) return;
+  // Une fenêtre est ouverte : Échap la ferme, les raccourcis de l'éditeur sont inactifs.
+  const modal = MODALS.find(m => !$(m).hidden);
+  if (modal) {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      document.activeElement?.blur?.();
+      closeModal(modal);
+    }
+    return;
+  }
+  if (!ed) return;
+  // Saisie de texte : les touches vont au champ ; Échap en sort.
+  if (isTextField(e.target)) {
+    if (e.key === 'Escape') e.target.blur();
+    return;
+  }
+  const combo = comboOf(e);
+  if (!combo) return;
+  const keys = editorKeys();
+  const action = Object.keys(keys).find(a => keys[a] === combo);
+  if (!action) return;
+  e.preventDefault();
+  if (e.repeat && !REPEATABLE.has(action)) return;
+  EDITOR_RUN[action]();
 });
+
+// Les infobulles et l'aide affichent les raccourcis actuels.
+function refreshKeyHints() {
+  const k = editorKeys();
+  const tip = (id, label, action) => { $(id).title = `${label} (${prettyKey(k[action])})`; };
+  tip('#play', 'Lecture', 'play');
+  tip('#t-split', 'Couper à la tête de lecture', 'split');
+  tip('#t-delete', 'Supprimer la sélection', 'delete');
+  tip('#t-undo', 'Annuler', 'undo');
+  tip('#t-redo', 'Rétablir', 'redo');
+  tip('#ed-back', 'Retour aux clips', 'back');
+  for (const n of document.querySelectorAll('kbd[data-key]')) n.textContent = prettyKey(k[n.dataset.key]);
+}
 
 async function openEditor(clip) {
   // Fichier venu d'un autre logiciel (SteelSeries GG, OBS…) : ses pistes audio sont séparées ici.
   try { clip = await invoke('prepare_clip', { path: clip.path }); } catch (e) { fail(e); }
   let saved = null;
   try { saved = JSON.parse(await invoke('load_project', { clipPath: clip.path })); } catch (e) { /* pas de projet */ }
-  ed = { clip, project: null, sel: null, T: 0, cur: 0, playing: false, undo: [], audios: [], ext: new Map(), images: new Map(), waves: [], duration: 0 };
+  ed = { clip, project: null, sel: null, T: 0, cur: 0, playing: false, undo: [], redo: [], audios: [], ext: new Map(), images: new Map(), waves: [], duration: 0 };
   $('#library').hidden = true;
   $('#editor').hidden = false;
   $('#ed-title').textContent = clip.name;
@@ -987,18 +1102,32 @@ async function showShare(path) {
   $('#share-reveal').onclick = () => invoke('reveal', { path });
   $('#share').hidden = false;
 }
+function closeShare() {
+  const v = $('#share-video');
+  v.pause(); v.removeAttribute('src'); v.load();
+  $('#share').hidden = true;
+}
+function closeModal(sel) {
+  if (sel === '#share') closeShare();
+  else $(sel).hidden = true;
+}
 $('#share').onclick = e => {
-  if (e.target.id === 'share' || e.target.closest('[data-close]')) {
-    const v = $('#share-video');
-    v.pause(); v.removeAttribute('src'); v.load();
-    $('#share').hidden = true;
-  }
+  if (e.target.id === 'share' || e.target.closest('[data-close]')) closeShare();
 };
 
 // ───────────────────────────── Réglages ─────────────────────────────
 function fillSettings() {
   $('#s-buffer').value = String(cfg.buffer_seconds);
   $('#s-hotkey').textContent = prettyKey(cfg.hotkey);
+  $('#s-toggle').textContent = prettyKey(cfg.toggle_hotkey);
+  $('#s-toggle-clear').hidden = !cfg.toggle_hotkey;
+  $('#s-mode').value = cfg.buffer_mode;
+  $('#s-mode-hint').textContent = {
+    game: "démarre au lancement d'un jeu, s'arrête 10 s après sa fermeture",
+    always: 'tourne tout le temps, même sans jeu (sollicite le GPU)',
+    manual: cfg.toggle_hotkey ? `${prettyKey(cfg.toggle_hotkey)} l'allume et l'éteint ; éteint au lancement de Clipo` : 'choisissez ci-dessous un raccourci pour l\'allumer et l\'éteindre',
+  }[cfg.buffer_mode] || '';
+  fillEditorKeys();
   $('#s-dir').textContent = cfg.clips_dir;
   $('#s-dir').title = cfg.clips_dir;
   $('#s-game').checked = cfg.record_game;
@@ -1087,13 +1216,21 @@ function bindSettings() {
     const dir = await dialog.open({ directory: true, defaultPath: cfg.clips_dir });
     if (dir) { await setConfig({ clips_dir: dir }); fillSettings(); refreshLibrary(); }
   };
-  // Saisie du raccourci : on attend une combinaison se terminant par une vraie touche.
-  const hk = $('#s-hotkey');
-  hk.onclick = e => {
+  $('#s-mode').onchange = async () => { await setConfig({ buffer_mode: $('#s-mode').value }); fillSettings(); };
+  bindGlobalKey($('#s-hotkey'), 'hotkey', 'toggle_hotkey');
+  bindGlobalKey($('#s-toggle'), 'toggle_hotkey', 'hotkey');
+  $('#s-toggle-clear').onclick = async e => { e.preventDefault(); await setConfig({ toggle_hotkey: '' }); fillSettings(); };
+  $('#s-keys-reset').onclick = async e => { e.preventDefault(); await setConfig({ editor_keys: {} }); fillSettings(); };
+}
+
+// Raccourci global (fonctionne en jeu) : une combinaison se terminant par une vraie touche.
+// Il est enregistré par position physique, comme l'exige Windows.
+function bindGlobalKey(btn, key, other) {
+  btn.onclick = e => {
     e.preventDefault();
-    hk.classList.add('rec');
-    hk.textContent = 'Appuyez…';
-    const stop = () => { hk.classList.remove('rec'); window.removeEventListener('keydown', onKey, true); fillSettings(); };
+    btn.classList.add('rec');
+    btn.textContent = 'Appuyez…';
+    const stop = () => { btn.classList.remove('rec'); window.removeEventListener('keydown', onKey, true); fillSettings(); };
     const onKey = async ev => {
       ev.preventDefault();
       ev.stopPropagation();
@@ -1107,13 +1244,59 @@ function bindSettings() {
       if (ev.shiftKey) parts.push('Shift');
       if (!parts.length && !/^F\d/.test(ev.code)) { toast('Ajoutez Ctrl, Alt ou Maj à la touche.'); return; }
       parts.push(ev.code);
+      const combo = parts.join('+');
       window.removeEventListener('keydown', onKey, true);
-      hk.classList.remove('rec');
-      await setConfig({ hotkey: parts.join('+') });
+      btn.classList.remove('rec');
+      if (combo === cfg[other]) { toast('Ce raccourci sert déjà à une autre action.'); fillSettings(); return; }
+      await setConfig({ [key]: combo });
       fillSettings();
     };
     window.addEventListener('keydown', onKey, true);
   };
+}
+
+// Raccourcis de l'éditeur : une ligne par action, chaque touche se change d'un clic.
+function fillEditorKeys() {
+  const box = $('#s-keys');
+  box.textContent = '';
+  const keys = editorKeys();
+  for (const [id, label] of EDITOR_ACTIONS) {
+    const row = el('div', 'row sub');
+    row.append(el('span', null, label));
+    const btn = el('button', 'btn key', prettyKey(keys[id]));
+    btn.onclick = e => { e.preventDefault(); captureEditorKey(btn, id); };
+    row.append(btn);
+    box.append(row);
+  }
+}
+
+// Toute touche est acceptée, Échap compris ; un clic ailleurs annule la saisie.
+function captureEditorKey(btn, id) {
+  btn.classList.add('rec');
+  btn.textContent = 'Appuyez…';
+  const stop = () => {
+    window.removeEventListener('keydown', onKey, true);
+    window.removeEventListener('pointerdown', onClick, true);
+    btn.classList.remove('rec');
+  };
+  const onClick = () => { stop(); fillSettings(); };
+  const onKey = async ev => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const combo = comboOf(ev);
+    if (!combo) return;
+    stop();
+    const keys = editorKeys();
+    const taken = EDITOR_ACTIONS.find(([other]) => other !== id && keys[other] === combo);
+    if (taken) { toast(`${prettyKey(combo)} sert déjà à « ${taken[1]} ».`); fillSettings(); return; }
+    const [, , def] = EDITOR_ACTIONS.find(([a]) => a === id);
+    const next = { ...(cfg.editor_keys || {}) };
+    if (combo === def) delete next[id]; else next[id] = combo;
+    await setConfig({ editor_keys: next });
+    fillSettings();
+  };
+  window.addEventListener('keydown', onKey, true);
+  setTimeout(() => window.addEventListener('pointerdown', onClick, true), 0);
 }
 
 // ───────────────────────────── Démarrage ─────────────────────────────

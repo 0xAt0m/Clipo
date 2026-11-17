@@ -29,7 +29,17 @@ pub struct Config {
     pub record_voice: bool,
     pub record_mic: bool,
     pub autostart: bool,
+    /// Interrupteur du buffer (pastille, menu, raccourci). En mode « manual »,
+    /// il repart éteint à chaque lancement.
     pub buffer_enabled: bool,
+    /// Quand le buffer tourne : "game" (pendant un jeu), "always" (en permanence)
+    /// ou "manual" (allumé et éteint au raccourci).
+    pub buffer_mode: String,
+    /// Raccourci global qui allume ou éteint le buffer (vide = aucun).
+    pub toggle_hotkey: String,
+    /// Raccourcis de l'éditeur modifiés par l'utilisateur (action → touche) ;
+    /// les actions absentes gardent leur raccourci par défaut.
+    pub editor_keys: std::collections::BTreeMap<String, String>,
     /// Décalage appliqué aux pistes audio (ms, positif = audio retardé).
     pub audio_offset_ms: i32,
     /// Fichier .wav joué à l'enregistrement d'un clip (vide = son intégré).
@@ -65,6 +75,9 @@ impl Default for Config {
             record_mic: true,
             autostart: false,
             buffer_enabled: true,
+            buffer_mode: "game".into(),
+            toggle_hotkey: "Alt+F9".into(),
+            editor_keys: Default::default(),
             audio_offset_ms: 0,
             sound_file: String::new(),
             sound_enabled: true,
@@ -116,6 +129,14 @@ impl Config {
         if self.hotkey.trim().is_empty() {
             self.hotkey = "Alt+F10".into();
         }
+        if !["game", "always", "manual"].contains(&self.buffer_mode.as_str()) {
+            self.buffer_mode = "game".into();
+        }
+        self.toggle_hotkey = self.toggle_hotkey.trim().to_string();
+        if self.toggle_hotkey.eq_ignore_ascii_case(&self.hotkey) {
+            self.toggle_hotkey.clear();
+        }
+        self.editor_keys.retain(|k, v| !k.is_empty() && v.len() < 40);
         self
     }
 }

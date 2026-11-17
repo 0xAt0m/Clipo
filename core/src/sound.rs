@@ -23,6 +23,18 @@ pub fn chime(ok: bool) -> Vec<u8> {
     note(&mut pcm, a, 110, 0.16);
     pcm.extend(std::iter::repeat(0).take((RATE / 50) as usize));
     note(&mut pcm, b, 190, 0.16);
+    wav(pcm)
+}
+
+/// Note unique et brève, distincte du signal de clip : aiguë quand le buffer
+/// s'allume, grave quand il s'éteint.
+pub fn blip(on: bool) -> Vec<u8> {
+    let mut pcm = Vec::new();
+    note(&mut pcm, if on { 1318.5 } else { 659.25 }, 140, 0.14);
+    wav(pcm)
+}
+
+fn wav(pcm: Vec<i16>) -> Vec<u8> {
     let len = (pcm.len() * 2) as u32;
     let mut h = Vec::with_capacity(44 + len as usize);
     h.extend_from_slice(b"RIFF");
@@ -51,4 +63,14 @@ pub fn install(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf
     let _ = std::fs::write(&ok, chime(true));
     let _ = std::fs::write(&err, chime(false));
     (ok, err)
+}
+
+/// Écrit les sons d'activation et de désactivation du buffer et renvoie leurs chemins.
+pub fn install_toggle(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let _ = std::fs::create_dir_all(dir);
+    let on = dir.join("buffer-on.wav");
+    let off = dir.join("buffer-off.wav");
+    let _ = std::fs::write(&on, blip(true));
+    let _ = std::fs::write(&off, blip(false));
+    (on, off)
 }

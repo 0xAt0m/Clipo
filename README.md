@@ -7,7 +7,8 @@ Clips de jeu et montage de base pour Windows 10/11, en version minimaliste.
 - **Montage simple** : volume par piste avec formes d'onde, durée ajustable en glissant les bords, coupes (y compris au milieu), texte, image, vidéo insérée.
 - **Export compressé** : Original, 100 Mo, 50 Mo ou 10 Mo (le dernier choix est mémorisé).
 - **Clips d'autres logiciels** : ajoutez leur dossier (SteelSeries GG, OBS…) dans Réglages → Bibliothèque ; les pistes audio séparées sont reconnues.
-- **Léger** : en fond, seuls un petit processus et l'encodeur matériel du GPU tournent. La fenêtre (et son moteur web) est détruite dès qu'on la ferme.
+- **Léger** : par défaut, le buffer ne tourne que pendant un jeu ; hors jeu, seul un petit processus reste en fond. La fenêtre (et son moteur web) est détruite dès qu'on la ferme.
+- **Raccourcis configurables** : clip, activation du buffer et toutes les touches de l'éditeur (Réglages → Raccourcis).
 
 ## Installer
 
@@ -23,16 +24,46 @@ Pour publier une version : `git tag v0.1.0 && git push --tags`.
 | Action | Comment |
 |---|---|
 | Enregistrer un clip | Raccourci global, bouton « Enregistrer un clip », ou clic droit sur l'icône de la zone de notification. Un son Windows confirme. |
-| Mettre en pause | Clic sur la pastille « Actif » ou menu de l'icône. |
-| Monter | Cliquer un clip. **Couper** (S) à la tête de lecture, cliquer un morceau, **Supprimer** (Suppr). Ctrl+Z annule. |
-| Régler le son | Curseur et bouton muet par piste, à droite de l'aperçu. |
+| Activer / désactiver le buffer | Alt + F9, clic sur la pastille, ou menu de l'icône. |
+| Monter | Cliquer un clip. **Couper** (S) à la tête de lecture, cliquer un morceau, **Supprimer** (C). Ctrl+Z annule, Ctrl+Y rétablit, Échap revient aux clips. |
+| Régler le son | Curseur par piste, à gauche de sa forme d'onde. |
 | Ajouter | **+ Texte**, **+ Image** (calques à déplacer à la souris), **+ Vidéo** (insérée à la tête de lecture). |
 | Ajuster la durée | Maintenir le clic gauche sur un bord d'un morceau et glisser. |
-| Exporter | Choisir le niveau de compression ; le fichier est créé dans le dossier des clips. |
+| Partager | Choisir le niveau de compression, puis glisser le fichier dans Discord. |
 
 Les clips sont des `.mp4` standards : première piste audio = mixage (lisible partout),
 pistes suivantes = Jeu / Vocal / Micro. Le dossier `.clipo` à côté des clips contient les
 vignettes, les pistes pour l'aperçu et les projets de montage.
+
+### Quand le buffer tourne
+
+Réglages → Clip → **Buffer actif** :
+
+| Mode | Comportement |
+|---|---|
+| Uniquement en jeu (défaut) | Démarre dès qu'un jeu est détecté, s'arrête 10 s après sa fermeture. Pastille bleue « En veille » hors jeu : aucune capture, GPU au repos. |
+| En permanence | Tourne tout le temps, même sur le bureau (sollicite le GPU). |
+| Au raccourci | Alt + F9 (modifiable) l'allume et l'éteint, avec une note brève aiguë ou grave. Éteint à chaque lancement de Clipo. |
+
+Dans tous les modes, le raccourci d'activation, la pastille et le menu de l'icône servent d'interrupteur.
+
+### Raccourcis
+
+Tous modifiables dans Réglages → Raccourcis (cliquer la touche, puis appuyer sur la nouvelle).
+
+| Action | Défaut |
+|---|---|
+| Enregistrer un clip (global) | Alt + F10 |
+| Activer / désactiver le buffer (global) | Alt + F9 |
+| Lecture / pause | Espace |
+| Couper à la tête de lecture | S |
+| Supprimer la sélection | C |
+| Annuler / Rétablir | Ctrl + Z / Ctrl + Y |
+| Retour aux clips | Échap |
+| Reculer / avancer d'une seconde | ← / → |
+| Image précédente / suivante | Maj + ← / Maj + → |
+
+Les raccourcis de l'éditeur suivent la lettre imprimée sur la touche (AZERTY compris).
 
 ### Discord
 
@@ -74,6 +105,7 @@ légère échoue.
 core/   moteur (Rust, sans interface)
   recorder.rs  ffmpeg capture l'écran (ddagrab) → encodeur GPU → segments de 2 s, purge continue
   capture.rs   WASAPI : capture par application (vocal), « tout sauf » (jeu), micro
+  watch.rs     suivi permanent et léger du jeu et de l'application vocale
   audio.rs     tampon circulaire par piste, calé sur une horloge commune
   clip.rs      assemblage du clip (vidéo copiée sans réencodage) + bibliothèque
   export.rs    montage → commande ffmpeg

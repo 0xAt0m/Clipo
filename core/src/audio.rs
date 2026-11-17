@@ -3,10 +3,11 @@
 //! clip, on relit exactement la fenêtre de temps de la vidéo.
 
 use crate::config::Config;
+use crate::watch::Apps;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
@@ -154,13 +155,8 @@ impl Track {
 /// État partagé entre les fils de capture.
 pub struct Shared {
     pub stop: AtomicBool,
-    /// PID racine de l'application vocale (0 = absente).
-    pub voice_pid: AtomicU32,
-    /// PID du jeu isolé (0 = aucun jeu détecté : la piste Jeu prend alors tout sauf le vocal).
-    pub game_pid: AtomicU32,
-    pub game_name: Mutex<String>,
-    /// Fenêtre du jeu (0 = aucune), partagée avec l'enregistreur vidéo.
-    pub game_hwnd: Arc<AtomicU64>,
+    /// Application vocale et jeu, suivis en permanence par le moteur.
+    pub apps: Arc<Apps>,
     pub mic: String,
 }
 
@@ -174,17 +170,10 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    pub fn start(cfg: &Config, dir: &Path, game_hwnd: Arc<AtomicU64>) -> Result<AudioEngine, String> {
+    pub fn start(cfg: &Config, dir: &Path, apps: Arc<Apps>) -> Result<AudioEngine, String> {
         let epoch = Instant::now();
         let epoch_sys = SystemTime::now();
-        let shared = Arc::new(Shared {
-            stop: AtomicBool::new(false),
-            voice_pid: AtomicU32::new(0),
-            game_pid: AtomicU32::new(0),
-            game_name: Mutex::new(String::new()),
-            game_hwnd,
-            mic: cfg.mic.clone(),
-        });
+        let shared = Arc::new(Shared { stop: AtomicBool::new(false), apps, mic: cfg.mic.clone() });
         let mut kinds = Vec::new();
         if cfg.record_game {
             kinds.push(Kind::Game);
@@ -200,13 +189,6 @@ impl AudioEngine {
         let mut threads = Vec::new();
         let mut files = Vec::new();
 
-        // Surveille la présence de l'application vocale.
-        {
-            let shared = shared.clone();
-            let (voice, game) = (cfg.voice_app.clone(), cfg.game_app.clone());
-            threads.push(std::thread::spawn(move || watch_apps(shared, voice, game)));
-        }
-
         for (i, kind) in kinds.into_iter().enumerate() {
             let path = dir.join(format!("audio{i}.pcm"));
             let track = Arc::new(
@@ -220,18 +202,6 @@ impl AudioEngine {
             }));
         }
         Ok(AudioEngine { epoch, epoch_sys, tracks, shared, threads, files })
-    }
-
-    pub fn voice_detected(&self) -> bool {
-        self.shared.voice_pid.load(Ordering::Relaxed) != 0
-    }
-
-    /// Nom du jeu actuellement isolé sur la piste Jeu.
-    pub fn game(&self) -> Option<String> {
-        if self.shared.game_pid.load(Ordering::Relaxed) == 0 {
-            return None;
-        }
-        Some(self.shared.game_name.lock().unwrap().clone())
     }
 
     /// Accès en lecture, utilisable sans verrouiller le moteur.
@@ -306,121 +276,6 @@ pub fn nap(shared: &Shared, total: Duration) {
         std::thread::sleep(d);
         left -= d;
     }
-}
-
-/// Applications qui passent en plein écran sans être des jeux.
-const NOT_GAMES: &[&str] = &[
-    "explorer", "clipo", "dwm", "chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "vlc",
-    "spotify", "applicationframehost", "searchhost", "lockapp", "textinputhost", "shellexperiencehost",
-    "startmenuexperiencehost", "obs64", "mpc-hc64", "wmplayer", "code", "devenv", "discord",
-];
-
-/// Lanceurs de jeux : un programme démarré par l'un d'eux est un jeu, même en fenêtré.
-const LAUNCHERS: &[&str] = &[
-    "steam", "epicgameslauncher", "upc", "ubisoftconnect", "uplay", "battle.net", "riotclientservices",
-    "leagueclient", "eadesktop", "ealauncher", "origin", "galaxyclient", "rockstarservice", "launcher",
-    "bethesda.net_launcher", "gamingservices", "xboxpcapp", "playnite.desktopapp", "heroic",
-];
-
-/// Programmes annexes des lanceurs (boutique, overlay, anti-triche…), qui ne sont pas des jeux.
-const LAUNCHER_PARTS: &[&str] = &[
-    "steamwebhelper", "steamservice", "gameoverlayui", "gameoverlayui64", "steamerrorreporter", "epicwebhelper",
-    "uplaywebcore", "upc", "ubisoftconnect", "battle.net", "riotclientux", "riotclientuxrender",
-    "riotclientcrashhandler", "leagueclientux", "leagueclientuxrender", "eadesktop", "eabackgroundservice",
-    "galaxyclient helper", "crashreportclient", "unitycrashhandler64", "easyanticheat", "vgtray", "cefsharp.browsersubprocess",
-];
-
-fn stem_of(name: &str) -> String {
-    let n = name.to_lowercase();
-    n.trim_end_matches(".exe").to_string()
-}
-
-/// Suit l'application vocale et le jeu.
-/// Un jeu est l'application au premier plan qui a été démarrée par un lanceur
-/// (Steam, Ubisoft Connect, Epic, Battle.net, Riot, EA…) ou qui occupe tout l'écran.
-/// Il reste « le jeu » tant qu'il tourne, même si l'on passe sur une autre fenêtre.
-fn watch_apps(shared: Arc<Shared>, voice_exe: String, game_exe: String) {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-    let Ok(mut sys) = System::new() else { return };
-    let voice = stem_of(&voice_exe);
-    let game = stem_of(&game_exe);
-    let auto = game.is_empty() || game == "auto";
-    while !shared.stop.load(Ordering::Relaxed) {
-        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
-        let name_of = |pid: u32| sys.process(Pid::from_u32(pid)).map(|p| stem_of(&p.name().to_string_lossy()));
-        // Racine d'une application : son parent n'est pas la même application.
-        let root_of = |want: &str| -> u32 {
-            if want.is_empty() {
-                return 0;
-            }
-            for p in sys.processes().values() {
-                if stem_of(&p.name().to_string_lossy()) != want {
-                    continue;
-                }
-                let parent_same = p.parent().and_then(|pp| name_of(pp.as_u32())).map(|n| n == want).unwrap_or(false);
-                if !parent_same {
-                    return p.pid().as_u32();
-                }
-            }
-            0
-        };
-        let from_launcher = |pid: u32| -> bool {
-            let mut cur = sys.process(Pid::from_u32(pid)).and_then(|p| p.parent());
-            for _ in 0..6 {
-                let Some(pp) = cur else { return false };
-                match name_of(pp.as_u32()) {
-                    Some(n) if LAUNCHERS.contains(&n.as_str()) => return true,
-                    Some(_) => cur = sys.process(pp).and_then(|p| p.parent()),
-                    None => return false,
-                }
-            }
-            false
-        };
-        shared.voice_pid.store(root_of(&voice), Ordering::Relaxed);
-
-        let mut pid = shared.game_pid.load(Ordering::Relaxed);
-        let mut hwnd = shared.game_hwnd.load(Ordering::Relaxed);
-        if pid != 0 && sys.process(Pid::from_u32(pid)).is_none() {
-            pid = 0;
-        }
-        let front = crate::capture::foreground();
-        if auto {
-            if let Some(f) = front {
-                if let Some(name) = name_of(f.pid) {
-                    let excluded = f.pid == std::process::id()
-                        || name == voice
-                        || NOT_GAMES.contains(&name.as_str())
-                        || LAUNCHERS.contains(&name.as_str())
-                        || LAUNCHER_PARTS.contains(&name.as_str());
-                    if !excluded && (f.fullscreen || from_launcher(f.pid)) {
-                        pid = f.pid;
-                        hwnd = f.hwnd;
-                    }
-                }
-            }
-        } else {
-            pid = root_of(&game);
-            // La fenêtre du jeu est repérée quand il passe au premier plan.
-            if let Some(f) = front {
-                let same_app = name_of(f.pid).map(|n| n == game).unwrap_or(false);
-                if pid != 0 && same_app {
-                    hwnd = f.hwnd;
-                }
-            }
-        }
-        if pid == 0 || (hwnd != 0 && !crate::capture::window_alive(hwnd)) {
-            hwnd = 0;
-        }
-        if pid != 0 {
-            if let Some(p) = sys.process(Pid::from_u32(pid)) {
-                *shared.game_name.lock().unwrap() = p.name().to_string_lossy().into_owned();
-            }
-        }
-        shared.game_pid.store(pid, Ordering::Relaxed);
-        shared.game_hwnd.store(hwnd, Ordering::Relaxed);
-        nap(&shared, Duration::from_secs(2));
-    }
-    shared.game_hwnd.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]
